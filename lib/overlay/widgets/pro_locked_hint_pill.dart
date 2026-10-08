@@ -7,8 +7,8 @@ import '../overlay_constants.dart';
 /// 通知渲染本组件首帧后揭示，3 秒后 Kotlin 收窗。视觉沿用 _StopHintPill 家族
 /// （黑 72% 半透明底 + 白字），跨背景对比度已验证。
 ///
-/// ⚠️ 渲染位置：OverlayHome.build 的 Pro 提示分支必须排在「84 < 88 硬不变量」
-/// 判定之前——提示态下 voiceMemo 仍为 idle 且窗口高 84 < 把手高 88，不短路
+/// ⚠️ 渲染位置：OverlayHome.build 的 Pro 提示分支必须排在胶囊高度硬不变量
+/// 判定之前——提示态下 voiceMemo 仍为 idle 且窗口高 84 属胶囊高度档，不短路
 /// 会被硬不变量渲染成空白（见 overlay_home.dart 该判定注释）。
 class ProLockedHintPill extends StatelessWidget {
   /// 停靠侧（父层透传：贴屏端边距随侧镜像，与录音胶囊对齐规则一致）

@@ -130,7 +130,8 @@ class PhonemeCorrectorResult {
   /// 已静默替换的匹配
   final List<PhonemeMatch> matches;
 
-  /// 达相似阈值但未替换的（提示用；含被短热词保险丝拦下的候选）
+  /// 达相似阈值但未替换的（提示用；含被短热词保险丝拦下的候选）。
+  /// 原样命中（原文逐字==热词）不进此处——替换无操作，提示也是废话。
   final List<PhonemeMatch> similars;
 }
 
@@ -207,7 +208,11 @@ class PhonemeCorrector {
               hotword: target,
             ));
           }
-          if (score >= similarThreshold) {
+          // 原样命中（原文逐字==热词）不提示：替换通道对它原地不替换，
+          // 这里再弹「X 听起来像 X」是废话（识别对了反而打扰）。
+          // ⚠️ 不能用 score<1.0 当过滤条件——100% 只代表发音一致，
+          // 同音错字（客听→客厅）恰恰是该提示的核心场景
+          if (score >= similarThreshold && original != target) {
             final m = PhonemeMatch(
               original: original,
               hotword: target,

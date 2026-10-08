@@ -5,12 +5,15 @@ import 'package:flutter/material.dart';
 //（编辑态硬件返回键取消编辑）
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:shengwuji_app/app_logger.dart';
 import 'package:vibration/vibration.dart';
 import '../ai_app_model.dart';
 import '../correction/context_corrector.dart';
 import '../db_helper.dart';
 import '../theme/app_theme_extension.dart';
+import '../utils/big_bang_search.dart';
 import '../utils/calendar_helper.dart';
+import '../utils/device_diagnostics.dart';
 import '../utils/diary_sync_bridge.dart';
 import '../utils/note_unlock_session.dart';
 import '../widgets/calendar_confirm_sheet.dart';
@@ -18,13 +21,16 @@ import '../widgets/swipe_dismiss_card.dart';
 import 'accessibility_overlay.dart';
 import 'overlay_constants.dart';
 import 'overlay_data_client.dart';
+import 'overlay_diary_reorder.dart';
 import 'overlay_state_controller.dart';
 import 'overlay_voice_memo.dart';
+import 'widgets/big_bang_layer.dart';
 import 'widgets/overlay_diary_card.dart';
 import 'widgets/overlay_handle.dart';
 import 'widgets/overlay_panel_header.dart';
 import 'widgets/overlay_voice_memo_bar.dart';
 import 'widgets/pro_locked_hint_pill.dart';
+import 'widgets/undo_delete_pill.dart';
 
 /// 悬浮窗主页
 ///
@@ -91,6 +97,28 @@ class _OverlayHomeState extends State<OverlayHome>
   // 时机同把手大小档位
   HandleTheme _handleTheme = HandleTheme.duo;
 
+  // ── 字体大小档位（设置页 overlay_font_size_step，-2~+2，每档 1pt）──
+  // 只作用日记面板文字（卡片收起/展开/编辑/删除确认 + 分隔线/空态/错误态）；
+  // 不作用把手（独立大小档位，叠加会双重缩放）与语音速记胶囊（宽度预算按
+  // 15 号字调过）。读取与生效时机同把手大小档位——下一次状态转换生效
+  int _fontSizeStep = OverlayConstants.fontSizeStepDefault;
+
+  // ── 面板高度（可见条数档位，设置页 overlay_panel_max_cards，6~10）──
+  // 驱动 _buildPanel 的列表限高（panelListMaxHeightFor）与面板顶部下压偏移
+  //（panelTopOffsetFor：每少 1 条下压一张卡高，整列底边不变、顶部按钮组
+  // 下移进拇指区）。读取与生效时机同把手大小档位——下一次状态转换生效，
+  // 已展开的面板不瞬移
+  int _panelMaxCards = OverlayConstants.panelMaxCardsDefault;
+
+  // ── 竖线距屏幕边缘的内移间距档位（设置页 overlay_edge_line_margin_dp，
+  // 0/8/16）── 只把竖线视觉向屏内侧偏移（贴黑边钢化膜防遮挡），窗口 20×64
+  // 与触摸缓冲区不动。读取与生效时机同把手大小档位——下一次状态转换生效，
+  // 已驻留的竖线不瞬移
+  int _edgeLineMarginDp = OverlayConstants.edgeLineMarginDefault;
+
+  /// 字号档位缩放简写（基准 + 档位，每档 1pt），面板各处文字共用
+  double _fs(double base) => OverlayConstants.fontScaled(base, _fontSizeStep);
+
   // ── 卡片交互状态（复选框归档 + 展开全文）──
   // 展开态真值：diary id 驱动（父层管理，归档移位/列表刷新不错位；
   // 读写方：itemBuilder 传卡片 / _toggleExpand / _toggleExpandAll）
@@ -106,6 +134,12 @@ class _OverlayHomeState extends State<OverlayHome>
   bool _expandFirstDiaryAfterLoad = false;
   // 删除写库进行中的 id（_onCardDelete 确认分支入口检查，防连点错乱）
   final Set<int> _deletingIds = {};
+
+  // ── 滑动删除撤销槽位（设置页 overlay_swipe_delete_enabled 开启后生效）──
+  // 单槽位：再次滑删时前一个立即落定（补删其录音文件）。槽内行的库行在
+  // 划走时已真删（墓碑已记），录音文件延迟到窗口到期/被打断才补删——
+  // 撤销要把行连同音频一起还原。撤销胶囊渲染在面板 header 下方
+  _PendingSwipeDelete? _pendingSwipeDelete;
 
   // ── 展开卡正文编辑态（点击正文进入，光标定位到点击位置）──
   // 编辑卡 id 真值（null=无编辑）。写方：_enterEdit / _exitEdit；
@@ -167,8 +201,28 @@ class _OverlayHomeState extends State<OverlayHome>
   // 窗口 resize 空白守卫（见 _MetricsStage 注释）：awaitingResize 期间渲染纯透明
   _MetricsStage _metricsStage = _MetricsStage.idle;
   // 上一次 build 的窗口约束，用于检测原生 resize 已落地（约束变化=新 metrics 已到）
-  // 写方：_maybeAdvanceMetricsStage（每次 build 顶层刷新）
+  // 写方：_maybeAdvanceMetricsStage（每次 build 顶层刷新，_windowRemoved 置位
+  // 期间拦死不刷）/ _resetFromNative（置 null）
+  // ⚠️ 窗口移除后必须置 null（基准只对同一窗口会话有效）：展开面板态被 toggle
+  // 隐藏时窗口以全屏尺寸移除，基准停在全屏；下次 showOverlay 以 28×88 重建后，
+  // 若 _expand 的 setState(awaitingResize) 先于首帧 build 执行，首帧 28×88 ≠
+  // 陈旧全屏基准会被误判"resize 已落地"提前摘守卫 → _waitForBlankFramePresented
+  // 续段见 stage != awaitingResize 直接中断 → controller.expand() 永不调用，
+  // 窗口卡死把手尺寸（2026-09-28 用户反馈"双击隐藏悬浮窗后再双击只出胶囊"）。
+  // 揭示门的"基准约束跨会话陈旧"（64b1c09）同款病理
   Size? _lastWindowConstraints;
+
+  // 窗口已移除标记：置位期间 _maybeAdvanceMetricsStage 不记基准。窗口被原生
+  // 移除后 FlutterView 的 metrics 仍停在移除前旧尺寸（展开态移除=全屏），
+  // reset 复位触发的尾帧 build 若照记，会把陈旧尺寸当场写回基准——
+  // _resetFromNative 的 null 清空被同会话尾帧污染（8a2c216 只清 null 没拦
+  // 记录，真机复现"还是只出胶囊"）。
+  // 置位方：_resetFromNative（唯一）；复位方：onExpand / onStartVoiceMemo /
+  // _onNewNote / onShowProLockedHint 四个 handler——Kotlin 的 showOverlay 全部
+  // 调用点都紧随这四个消息之一，即"新窗口会话开始"的 Dart 侧权威信号。
+  // ⚠️ 不能在 _expand 里复位：转写完成于窗口移除后时 _onVoiceMemoChanged 也
+  // 会调 _expand（resize 被 Kotlin 空守卫吞掉），在那复位会重新打开污染窗口
+  bool _windowRemoved = false;
 
   // ── 揭示门（语音速记冷启动隐藏窗口的揭示竞态防护）──
   // Kotlin hidden=true 窗口直建胶囊尺寸（312×84），把手尺寸的窗口在此路径
@@ -190,10 +244,28 @@ class _OverlayHomeState extends State<OverlayHome>
 
   // Pro 未解锁提示态：Kotlin 门禁拦截悬浮窗系按键后直建 312×84 隐藏窗并
   // 通知渲染「暂未解锁」提示胶囊（ProLockedHintPill）。渲染分支必须排在
-  // 揭示门与「84<88 硬不变量」判定之前（提示态 voiceMemo 仍 idle、窗口高
-  // 84<88，不短路会被两者渲染成空白）。清零方：_resetFromNative（Kotlin
+  // 揭示门与胶囊高度硬不变量判定之前（提示态 voiceMemo 仍 idle、窗口高
+  // 84 属胶囊高度档，不短路会被两者渲染成空白）。清零方：_resetFromNative（Kotlin
   // 3 秒收窗/用户 toggle 关掉都会走 hideOverlay → reset）
   bool _proHintShown = false;
+
+  // 大爆炸分词层原文（非 null = 全屏模态展示中，big_bang_layer.dart）：
+  // 展开卡正文长按 _openBigBang 置位；✕/复制成功/收起/reset 清零。
+  // 只存原文——词块状态（选中集/分词结果）全在层内 State，关掉即弃
+  String? _bigBangText;
+
+  // build 渲染分支追踪（2026-09-26 用户反馈「滑动收起后把手/竖线不出现」
+  // 诊断，不可复现靠日志定位）：分支切换才打 log，直接回答「把手分支有没有
+  // 被渲染过」——log 序列里出现「渲染分支 → 把手」= 把手像素进过帧，此后
+  // 消失即断点在原生窗口层；从未出现 = Dart 侧分支选错（守卫/约束判定问题）
+  String _lastBuildBranch = '';
+
+  /// 标记本帧渲染的分支；与上一帧不同才写日志（防每帧刷屏）
+  void _markBuildBranch(String branch) {
+    if (_lastBuildBranch == branch) return;
+    _lastBuildBranch = branch;
+    log('🖼 [OverlayHome] 渲染分支 → $branch');
+  }
 
   // 真展开路径（有空白帧等待的）抑制叠加把手渲染：空白期把手已消失，
   // 恢复渲染若再满显重现会形成"消失→重现→渐隐"三段闪烁；把手的位置
@@ -236,6 +308,14 @@ class _OverlayHomeState extends State<OverlayHome>
     super.initState();
     _controller.addListener(_onStateChanged);
     _voiceMemo.addListener(_onVoiceMemoChanged);
+    // 设备诊断信息记一次（悬浮窗「收起后把手/竖线不出现」定位用——覆盖
+    // 「主 App 未启动、仅悬浮窗 engine 在跑」的场景；fire-and-forget）
+    unawaited(
+      DeviceDiagnosticsLogger.logOnce(
+        engine: 'overlay',
+        fetch: AccessibilityOverlay.getDeviceDiagnostics,
+      ),
+    );
     // 冷启动先按右缘（历史缺省）渲染首帧，停靠侧异步刷新后若为左缘再镜像
     _refreshOverlayConfig();
     // 面板滑动动画控制器：初始 value 默认 0（dismissed）= 冷启动即收起态，
@@ -268,6 +348,10 @@ class _OverlayHomeState extends State<OverlayHome>
     AccessibilityOverlay.setupNativeChannel(
       onExpand: () {
         if (!mounted) return;
+        // 新窗口会话开始：解除基准记录抑制（见 _windowRemoved 注释，
+        // 四个建窗消息 handler 同款复位）
+        _windowRemoved = false;
+        log('📩 [OverlayHome] 收到原生 expand 消息 → 展开面板');
         // 立即 resize 会把旧纹理重投影到新窗口（巨型把手闪现），扩窗时机统一
         // 由 _expand 的空白帧协议管理；"展开态残留"由 hideOverlay 的 reset 复位
         // + _expand 稳定展开分支兜底
@@ -281,6 +365,8 @@ class _OverlayHomeState extends State<OverlayHome>
       // ptt：true = 按住说话会话（松手即停），透传给 controller 选停止提示文案
       onStartVoiceMemo: (hiddenReveal, ptt) async {
         if (!mounted) return;
+        // 新窗口会话开始：解除基准记录抑制（见 _windowRemoved 注释）
+        _windowRemoved = false;
         if (hiddenReveal) {
           // 隐藏窗口模式：handler 顶部立即挂门——门挂上之前的 await 链
           //（权限/prefs/开流，20~80ms）期间 state 仍是 idle，晚挂门会让
@@ -331,6 +417,8 @@ class _OverlayHomeState extends State<OverlayHome>
       // 提示分支 postFrame 发 voiceMemoUiReady，3 秒后 Kotlin 收窗走 reset）
       onShowProLockedHint: () {
         if (!mounted) return;
+        // 新窗口会话开始：解除基准记录抑制（见 _windowRemoved 注释）
+        _windowRemoved = false;
         setState(() => _proHintShown = true);
       },
       // 原生 ACTION_SCREEN_OFF（锁屏即重锁）→ 收起已展开的锁定卡 + 打码。
@@ -378,6 +466,9 @@ class _OverlayHomeState extends State<OverlayHome>
     // 回调 use-after-free，同主 App diary_tab 的清理顺序）
     _playerCompleteSub?.cancel();
     _audioPlayer.dispose();
+    // 滑动删除撤销槽位落定：组件销毁即放弃撤销窗口，补删录音文件
+    //（silent 不走 setState——dispose 内元素已 defunct）
+    _finalizePendingSwipeDelete(silent: true);
     // 编辑态资源清理：返回键 handler + controller + focusNode
     //（防御性——正常退出编辑已在 _exitEdit 清理，此处兜 dispose 时仍编辑中的边角）
     HardwareKeyboard.instance.removeHandler(_editKeyHandler);
@@ -389,9 +480,9 @@ class _OverlayHomeState extends State<OverlayHome>
   /// 状态变化时同步调整悬浮窗尺寸
   void _onStateChanged() {
     final size = _controller.panelSize;
-    print(
+    log(
       '📐 [OverlayHome] 状态变化: ${_controller.state.name}, '
-      'size=${size.width.toInt()}x${size.height.toInt()}',
+      'size=${size.width.toInt()}x${size.height.toInt()} → 发 resize',
     );
     AccessibilityOverlay.resizeOverlay(size.width.toInt(), size.height.toInt());
     if (mounted) {
@@ -406,8 +497,7 @@ class _OverlayHomeState extends State<OverlayHome>
     final cur = _voiceMemo.state;
     _lastVoiceMemoState = cur;
     if (cur != prev) {
-      // ignore: avoid_print
-      print('🎙️ [OverlayHome] 语音速记状态: ${prev.name} → ${cur.name}');
+      log('🎙️ [OverlayHome] 语音速记状态: ${prev.name} → ${cur.name}');
       if (cur == OverlayVoiceMemoState.recording ||
           cur == OverlayVoiceMemoState.transcribing) {
         // 防御：录音态结束（秒停进转写）而揭示门还挂着（极端时序：build 的
@@ -636,6 +726,17 @@ class _OverlayHomeState extends State<OverlayHome>
       await _ensureNoteUnlocked();
       return;
     }
+    if (!locked) {
+      // 加锁前置检查：设备未设锁屏密码（PIN/图案/密码）时不允许锁定——
+      // 锁定后没有任何认证手段能看回内容，锁定形同虚设反而误导用户以为
+      // 已保护。弹引导对话框（可选跳系统安全设置页），本次不加锁
+      final secure = await AccessibilityOverlay.isDeviceSecure();
+      if (!mounted) return;
+      if (!secure) {
+        await _showNoScreenLockDialog();
+        return;
+      }
+    }
     AccessibilityOverlay.vibrateTick();
     try {
       await DbHelper().setDiaryLocked(id, !locked);
@@ -660,6 +761,36 @@ class _OverlayHomeState extends State<OverlayHome>
       print('🔒 [OverlayHome] 笔记锁定状态已切换 id=$id locked=${!locked}');
     } catch (e) {
       print('❌ [OverlayHome] 锁定状态切换失败 id=$id: $e');
+    }
+  }
+
+  /// 加锁前置检查未通过的引导弹窗：设备未设置锁屏密码 → 提示先去系统
+  /// 设置里设锁屏密码（「去设置」拉起系统安全设置页），本笔记不加锁。
+  /// 对话框渲染在悬浮窗全屏窗口内（锁按钮只在展开面板的卡片上出现，
+  /// 此刻窗口必为全屏，AlertDialog 可正常展示）
+  Future<void> _showNoScreenLockDialog() async {
+    if (!mounted) return;
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("未设置锁屏密码"),
+        content: const Text(
+          "锁定笔记需要先用锁屏密码（或指纹）保护手机，否则锁定后无法验证身份。\n\n请先在系统设置中设置锁屏密码，再回来锁定。",
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text("取消"),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text("去设置"),
+          ),
+        ],
+      ),
+    );
+    if (go == true) {
+      await AccessibilityOverlay.openSecuritySettings();
     }
   }
 
@@ -827,14 +958,30 @@ class _OverlayHomeState extends State<OverlayHome>
   Future<void> _onCardSwipeDismissed(Map<String, dynamic> diary) async {
     final id = diary['id'] as int;
     final isArchived = (diary['is_archived'] as int? ?? 0) == 1;
-    // 锁定打码卡：未归档卡划走 = 归档（不涉内容，放行）；已归档卡划走 =
-    // 彻底删除（内容级操作），先过认证
-    if (isArchived && _isLockedHidden(diary)) {
+    // 「滑动直接删除」开关现场读（动作型开关，同 _onEdgeLineTap 模式：
+    // reload 后读，即时生效无需内存镜像；读失败按关=归档兜底）。
+    // 已归档卡划走本来就是删除，不读本开关
+    bool swipeDelete = false;
+    if (!isArchived) {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.reload();
+        swipeDelete =
+            prefs.getBool(OverlayConstants.swipeDeletePrefKey) ?? false;
+      } catch (e) {
+        print('⚠️ [OverlayHome] 读滑动删除开关失败（按归档兜底）: $e');
+      }
+    }
+    // 锁定打码卡：划走=归档（不涉内容，放行）；划走=删除（内容级操作——
+    // 已归档卡恒删除、活跃卡在滑动删除开关开启时也是删除），先过认证
+    if ((isArchived || swipeDelete) && _isLockedHidden(diary)) {
       await _ensureNoteUnlocked();
       return;
     }
     // 写库进行中忽略（防抖，同复选框归档/删除按钮入口检查）
-    final debouncing = isArchived ? _deletingIds : _archivingIds;
+    final debouncing = (isArchived || swipeDelete)
+        ? _deletingIds
+        : _archivingIds;
     if (debouncing.contains(id)) return;
     debouncing.add(id);
     // 整个交互流程包进 try/finally：任何一步抛异常都解除防抖（同 _toggleArchive）
@@ -854,6 +1001,10 @@ class _OverlayHomeState extends State<OverlayHome>
       if (isArchived) {
         // 已归档 → 删除（tick 震动/停播/删行删音频/bump/刷新都在共用体内）
         await _deleteDiaryConfirmed(diary);
+      } else if (swipeDelete) {
+        // 滑动直接删除：真删库行 + 顶部撤销胶囊（窗口内可撤销，
+        // 录音文件窗口到期才补删），见 _swipeDeleteWithUndo
+        await _swipeDeleteWithUndo(diary);
       } else {
         // 未归档 → 归档：仅置标记保留音频（overlay 侧归档可恢复，同
         // _toggleArchive 注释），轻震动确认
@@ -873,6 +1024,77 @@ class _OverlayHomeState extends State<OverlayHome>
     } finally {
       debouncing.remove(id);
     }
+  }
+
+  /// 滑动直接删除执行体（「滑动直接删除」开关开启时活跃卡划走的分支）：
+  /// 真删库行（墓碑由 DbHelper.deleteDiary 内置记录）→ 顶部撤销胶囊挂
+  /// 撤销槽位（OverlayConstants.swipeDeleteUndoWindow 窗口）。录音文件
+  /// **不在此处删**——撤销需把行连同音频一起还原，音频由
+  /// [_finalizePendingSwipeDelete] 在窗口到期/被打断时补删
+  Future<void> _swipeDeleteWithUndo(Map<String, dynamic> diary) async {
+    // 单槽位：上一个待撤销删除立即落定（补删其录音文件）
+    _finalizePendingSwipeDelete();
+    final id = diary['id'] as int;
+    try {
+      // 播放中的卡被删前先停播（同 _deleteDiaryConfirmed；撤销窗口内音频
+      // 还在盘上，但继续播"已删除"的卡语义混乱）
+      if (_playingDiaryId == id) {
+        await _stopAudioPlayback();
+      }
+      // 确认删除同款 tick 震动
+      AccessibilityOverlay.vibrateTick();
+      await _dataClient.deleteDiaryRowOnly(id);
+      // 主 App 感知本次删除（跨 engine 计数桥，见 DiarySyncBridge）
+      DiarySyncBridge.bump();
+      _pendingSwipeDelete = _PendingSwipeDelete(
+        // 行快照：撤销时全字段原样插回（sync_uuid 保留、墓碑清除）
+        row: Map<String, dynamic>.of(diary),
+        timer: Timer(
+          OverlayConstants.swipeDeleteUndoWindow,
+          _finalizePendingSwipeDelete,
+        ),
+      );
+      setState(() {}); // 面板顶部浮现撤销胶囊
+    } catch (e) {
+      print('❌ [OverlayHome] 滑动删除失败 id=$id: $e');
+      // 回库恢复真相（乐观移除可能已偏离真实状态）
+      await _loadDiaries(showLoading: false);
+    }
+  }
+
+  /// 撤销窗口关闭（到期/面板收起/窗口移除/dispose/新删除顶替）：落定删除——
+  /// 补删录音文件并摘掉撤销胶囊。库行在划走时已真删，此处只剩音频补删
+  void _finalizePendingSwipeDelete({bool silent = false}) {
+    final pending = _pendingSwipeDelete;
+    if (pending == null) return;
+    pending.timer.cancel();
+    _pendingSwipeDelete = null;
+    unawaited(
+      _dataClient.deleteAudioFile(pending.row['audio_path'] as String?),
+    );
+    // silent=true 用于 dispose（元素已 defunct，setState 会抛）
+    if (!silent && mounted) setState(() {});
+  }
+
+  /// 撤销滑动删除（撤销胶囊按钮）：库行原样插回（sync_uuid 保留、墓碑
+  /// 清除，见 DbHelper.restoreDeletedDiary）+ 静默重查让卡片回到原位置
+  ///（排序 is_archived ASC, created_at DESC，时间戳未变故位置还原）。
+  /// 音频文件在窗口内从未删除，无需还原
+  Future<void> _undoSwipeDelete() async {
+    final pending = _pendingSwipeDelete;
+    if (pending == null) return;
+    pending.timer.cancel();
+    setState(() => _pendingSwipeDelete = null);
+    try {
+      await _dataClient.restoreDeletedDiary(pending.row);
+      // 主 App 感知本次恢复（跨 engine 计数桥，见 DiarySyncBridge）
+      DiarySyncBridge.bump();
+      // 轻震动确认（对齐归档反馈）
+      _vibrate();
+    } catch (e) {
+      print('❌ [OverlayHome] 撤销删除失败: $e');
+    }
+    await _loadDiaries(showLoading: false);
   }
 
   /// 删除确认态取消（✗）：退出确认态，底行还原
@@ -907,6 +1129,38 @@ class _OverlayHomeState extends State<OverlayHome>
     }
   }
 
+  /// 活跃区卡片长按拖动排序（ReorderableListView onReorder 回调）。
+  /// 内存先行：setState 立即反映落位，拖动/动画期间不查库；DB 持久化随后——
+  /// reorderActiveDiaries 事务内把活跃区 sort_order 规范重写为 0..n-1
+  ///（归档行不动），成功后 bump 主 App 日记页（DiarySyncBridge 计数桥）。
+  /// 落点 clamp 与归档区保护在纯函数 reorderActiveItems 内
+  ///（拖到归档区位置 = 落到活跃区末尾）。失败回库恢复真相（照 _setDiaryTag 模式）。
+  Future<void> _onReorderDiary(int oldIndex, int newIndex) async {
+    final reordered = reorderActiveItems<Map<String, dynamic>>(
+      items: _diaries,
+      isArchived: (d) => (d['is_archived'] as int? ?? 0) == 1,
+      oldIndex: oldIndex,
+      newIndex: newIndex,
+    );
+    // 归档区落点等 no-op：原样列表返回，不 setState 不落库
+    if (identical(reordered, _diaries)) return;
+    setState(() => _diaries = reordered);
+    try {
+      final activeIds = [
+        for (final d in reordered)
+          if ((d['is_archived'] as int? ?? 0) != 1) d['id'] as int,
+      ];
+      await DbHelper().reorderActiveDiaries(activeIds);
+      // 主 App 日记页感知排序变化（跨 engine 计数桥，见 DiarySyncBridge）
+      DiarySyncBridge.bump();
+      print('↕️ [OverlayHome] 活跃区排序已落库 $oldIndex→$newIndex');
+    } catch (e) {
+      print('❌ [OverlayHome] 排序落库失败: $e');
+      // 失败回库恢复真相
+      await _loadDiaries(showLoading: false);
+    }
+  }
+
   /// 卡片复制按钮：原生写剪贴板 + tick 震动（原生侧完成，对齐日记页反馈），
   /// 成功后自动收起面板回把手（用户复制完即走，与分享后收起同语义）。
   /// 入口日志区分"tap 未触发"与"通道/写入失败"两类问题。
@@ -922,9 +1176,9 @@ class _OverlayHomeState extends State<OverlayHome>
       final ok = await AccessibilityOverlay.copyText(content);
       if (!mounted) return;
       if (ok) {
-        print('✅ [OverlayHome] 已复制到剪贴板，收起面板');
+        log('✅ [OverlayHome] 已复制到剪贴板，收起面板');
         // 复制完成即收起回把手（与分享后收起同路径；_collapse 幂等守卫兜底）
-        _collapse();
+        _collapse(source: '复制完成');
       } else {
         print('❌ [OverlayHome] 原生写剪贴板返回失败');
       }
@@ -954,7 +1208,9 @@ class _OverlayHomeState extends State<OverlayHome>
       final prefs = await SharedPreferences.getInstance();
       await prefs.reload();
       final appId = prefs.getString('selected_ai_app') ?? 'chatgpt';
-      final app = AIApp.findById(appId) ?? AIApp.defaultApp;
+      // 须用 resolveAppById（内置未命中再查自定义列表）：findById 只查内置，
+      // 选了二级页 + 号添加的自定义应用会查无 → 静默回落 ChatGPT（2026-09-25 修）
+      final app = await AIApp.resolveAppById(appId) ?? AIApp.defaultApp;
       // 1. 原生复制到剪贴板（原生侧完成震动反馈，与复制按钮同路径）
       final copied = await AccessibilityOverlay.copyText(content);
       if (!mounted) return;
@@ -979,7 +1235,7 @@ class _OverlayHomeState extends State<OverlayHome>
       );
       // 收起回把手（与复制/分享后收起同路径；_collapse 幂等守卫兜底）。
       // 拉起失败面板保持展开，用户可改走复制按钮
-      if (launched) _collapse();
+      if (launched) _collapse(source: 'AI对话跳转');
     } catch (e) {
       print('❌ [OverlayHome] AI 对话失败: $e');
     }
@@ -1014,7 +1270,7 @@ class _OverlayHomeState extends State<OverlayHome>
         // resize 发出时完成，触摸区已缩回把手）再拉起；超时兜底放行，同
         // _waitForBlankFramePresented 的保守哲学：帧管线极端卡顿优先保功能。
         // 上限 ≈ 动画 240ms + 空白帧等待上限 300ms + resize 往返余量
-        _collapse();
+        _collapse(source: '日历权限路径');
         final collapseDone = _collapseSettled?.future;
         if (collapseDone != null) {
           await collapseDone.timeout(
@@ -1056,7 +1312,7 @@ class _OverlayHomeState extends State<OverlayHome>
         AccessibilityOverlay.vibrateTick();
         // 添加完成即收起面板回把手（与复制/AI 跳转后收起同语义；
         // _collapse 幂等守卫兜底）
-        _collapse();
+        _collapse(source: '写日历完成');
       } else {
         // 结果码打日志便于远程定位（如 no_calendar_account = 系统日历被卸载/停用）
         print('❌ [OverlayHome] 写日历失败（码 $code，原生已 Toast 提示）');
@@ -1299,6 +1555,8 @@ class _OverlayHomeState extends State<OverlayHome>
   /// 悬浮窗已显示且面板展开时重复触发 = 再新增一条（产品已定此语义）
   Future<void> _onNewNote() async {
     if (!mounted) return;
+    // 新窗口会话开始：解除基准记录抑制（见 _windowRemoved 注释）
+    _windowRemoved = false;
     // 录音/转写中忽略（语音胶囊在屏，面板交互不可达）
     if (_voiceMemo.state != OverlayVoiceMemoState.idle) return;
     // 面板已稳定展开时跳过 _expand：否则会走"稳定展开态防御重播"分支
@@ -1382,7 +1640,7 @@ class _OverlayHomeState extends State<OverlayHome>
     }
     // 稳定收起态重复收起 → _collapse 幂等返回，_collapseSettled 不动
     //（此时为 null 或上一轮已完成的信号，下方 await 立即放行）
-    _collapse();
+    _collapse(source: '打开随手记');
     final collapseDone = _collapseSettled?.future;
     if (collapseDone != null) {
       await collapseDone.timeout(
@@ -1418,6 +1676,7 @@ class _OverlayHomeState extends State<OverlayHome>
       await completer.future.timeout(const Duration(milliseconds: 300));
     } catch (_) {
       // 超时兜底：继续走 resize（极端卡顿时闪烁风险换功能可用）
+      log('⚠️ [OverlayHome] 空白帧等待超时（300ms），继续走 resize 保功能');
     }
   }
 
@@ -1428,13 +1687,16 @@ class _OverlayHomeState extends State<OverlayHome>
   ///（揭示门的摘/挂不在此：隐藏窗口直建胶囊尺寸，摘门条件 = build 挂门
   /// 短路处的"录音态首帧"，见 _revealGatePending 注释）
   void _maybeAdvanceMetricsStage(BoxConstraints constraints) {
+    // 窗口已移除：metrics 是移除前旧尺寸的残影，记基准只会污染下个会话
+    //（见 _windowRemoved 注释）；reset 复位后 stage 恒 idle 也无守卫可推进
+    if (_windowRemoved) return;
     final size = Size(constraints.maxWidth, constraints.maxHeight);
     final last = _lastWindowConstraints;
     _lastWindowConstraints = size;
     if (_metricsStage != _MetricsStage.awaitingResize) return;
     if (last == null || last == size) return; // resize 尚未落地
     _metricsStage = _MetricsStage.idle;
-    print(
+    log(
       '📐 [OverlayHome] resize 已落地: '
       '${last.width.toStringAsFixed(1)}x${last.height.toStringAsFixed(1)} → '
       '${size.width.toStringAsFixed(1)}x${size.height.toStringAsFixed(1)}，恢复渲染',
@@ -1465,12 +1727,13 @@ class _OverlayHomeState extends State<OverlayHome>
   /// collapse 之后才通过）。顺序不可换。
   /// phase 守卫：value setter / stop 可能补发的同向 status 回调被吞掉，不重放链
   void _onPanelAnimStatus(AnimationStatus status) {
+    log('🎬 [OverlayHome] 面板动画回调: $status, phase=$_panelAnimPhase');
     if (status == AnimationStatus.completed &&
         _panelAnimPhase == _PanelAnimPhase.expanding) {
       setState(() {
         _panelAnimPhase = _PanelAnimPhase.idle;
       });
-      print('🎬 [OverlayHome] 面板滑入完成 → 稳定展开');
+      log('🎬 [OverlayHome] 面板滑入完成 → 稳定展开');
     } else if (status == AnimationStatus.dismissed &&
         _panelAnimPhase == _PanelAnimPhase.collapsing) {
       _panelAnimPhase = _PanelAnimPhase.idle;
@@ -1487,10 +1750,15 @@ class _OverlayHomeState extends State<OverlayHome>
   /// stage 保持 awaitingResize 直到小 metrics 落地由 _maybeAdvanceMetricsStage
   /// 清除（期间把手分支也渲染空白，落地后把手出现于停靠缘垂直居中）
   Future<void> _finishCollapse() async {
+    log('🎬 [OverlayHome] 收起收尾：等待空白帧呈现…');
     await _waitForBlankFramePresented();
     if (!mounted || _metricsStage != _MetricsStage.awaitingResize) {
       // 期间被 reset/语音打断（两者都会清守卫）：窗口已被接管，等待方直接
       // 放行（reset 路径窗口已移除必然不挡；语音路径胶囊是小窗口不挡授权框）
+      log(
+        '🎬 [OverlayHome] 收起收尾中断：mounted=$mounted, stage=$_metricsStage'
+        '（被 reset/语音接管，缩窗与自动隐藏不再执行）',
+      );
       _collapseSettled?.complete();
       _collapseSettled = null;
       return;
@@ -1503,7 +1771,7 @@ class _OverlayHomeState extends State<OverlayHome>
     _deleteConfirmIds.clear();
     _controller.collapse(); // → resize(28,88)；此刻旧纹理已是空白 → 无重投影闪烁
     _scheduleAutoHide(); // 收起态排定自动隐藏（必须在 collapse 之后）
-    print('🎬 [OverlayHome] 面板滑出完成 → 缩窗回把手 + 排定自动隐藏');
+    log('🎬 [OverlayHome] 面板滑出完成 → 缩窗回把手 + 排定自动隐藏');
     // 缩窗 resize 已发出，放行等待方（_onCardAlarm 权限路径此刻拉起主 App，
     // 系统授权框弹出时悬浮窗已只剩把手不挡触摸）
     _collapseSettled?.complete();
@@ -1515,6 +1783,10 @@ class _OverlayHomeState extends State<OverlayHome>
   /// 扩窗前走空白帧协议：先渲染纯透明帧并等其真正呈现再 resize，防止旧纹理
   /// 被 TextureView 重投影到新窗口——巨型把手/左上角飞闪的根因修复）
   Future<void> _expand() async {
+    log(
+      '🎬 [OverlayHome] 展开请求: phase=$_panelAnimPhase, '
+      'controller=${_controller.state.name}',
+    );
     // 停靠侧刷新（await）：面板锚点/推屏方向/卡片镜像必须赶在滑入动画的
     // 首个 setState 前就位，展开是设置变更后的第一个用户可见转换
     await _refreshOverlayConfig();
@@ -1524,8 +1796,10 @@ class _OverlayHomeState extends State<OverlayHome>
     _autoHideTimer = null;
     if (_panelAnimPhase == _PanelAnimPhase.expanding) {
       // 展开动画中重复触发（onExpand 防御 resize 与把手点击竞态）→ 幂等 no-op
+      log('🎬 [OverlayHome] 展开忽略：已在展开动画中');
     } else if (_panelAnimPhase == _PanelAnimPhase.collapsing) {
       // 收起动画中点渐显把手/长按自动展开 → 从当前进度反向滑回（窗口不动零 resize）
+      log('🎬 [OverlayHome] 收起动画中断 → 反向滑回展开');
       setState(() {
         _panelAnimPhase = _PanelAnimPhase.expanding;
         // 中断收起场景把手连续渐显（无空白期），不抑制叠加把手
@@ -1536,6 +1810,7 @@ class _OverlayHomeState extends State<OverlayHome>
       // 主路径：稳定收起态。先渲染空白帧并等其真正呈现（旧把手纹理不能被
       // 重投影到新窗口），再 controller.expand() 触发 resize(-1,-1)；
       // 滑入动画等大 metrics 落地后由 _maybeAdvanceMetricsStage 启动
+      log('🎬 [OverlayHome] 展开主路径：收起态 → 空白帧协议扩窗');
       _panelAnim.value = 0;
       setState(() {
         _panelAnimPhase = _PanelAnimPhase.expanding;
@@ -1545,6 +1820,10 @@ class _OverlayHomeState extends State<OverlayHome>
       });
       await _waitForBlankFramePresented();
       if (!mounted || _metricsStage != _MetricsStage.awaitingResize) {
+        log(
+          '🎬 [OverlayHome] 展开中断：mounted=$mounted, stage=$_metricsStage'
+          '（等待空白帧期间被 reset/语音打断）',
+        );
         return; // 等待期间被 reset/语音打断（两者都会清守卫，stage 变化即中断信号）
       }
       _controller.expand(); // → resize(-1,-1)；此刻旧纹理已是空白 → 无重投影闪烁
@@ -1562,6 +1841,10 @@ class _OverlayHomeState extends State<OverlayHome>
       });
       await _waitForBlankFramePresented();
       if (!mounted || _metricsStage != _MetricsStage.awaitingResize) {
+        log(
+          '🎬 [OverlayHome] 展开中断：mounted=$mounted, stage=$_metricsStage'
+          '（等待空白帧期间被 reset/语音打断）',
+        );
         return; // 等待期间被 reset/语音打断（两者都会清守卫，stage 变化即中断信号）
       }
       AccessibilityOverlay.resizeOverlay(-1, -1);
@@ -1571,22 +1854,46 @@ class _OverlayHomeState extends State<OverlayHome>
     _syncDiariesIfChanged();
   }
 
+  /// 唤起大爆炸分词层（展开卡正文长按，big_bang_layer.dart）：
+  /// 全屏模态把正文炸成词块，点选/滑选后一键复制。触感与卡片 AI 对话
+  /// 按钮的复制震动同档（EFFECT_TICK 线性马达家族）
+  void _openBigBang(String content) {
+    AccessibilityOverlay.performHaptic('tick');
+    setState(() => _bigBangText = content);
+  }
+
   /// 收起为把手（推屏滑出：先在保持全屏的窗口里朝停靠缘滑出渐隐——全程无 resize
   /// 窗口不动；缩窗延迟到 dismissed 边界的空白帧收尾，见 _finishCollapse）。
   /// 自动隐藏计时同样在收尾中排定（收起到位才算"收起态"）。
   /// 收起动画期间不渲染把手，保证 dismissed 末帧纯空白
-  void _collapse() {
+  /// [source] 触发来源标签（诊断日志用：用户反馈"滑动收起后把手从未出现"，
+  /// 靠来源 + 后续链路日志定位断点，2026-09-26）
+  void _collapse({String source = '未标注'}) {
+    log(
+      '🎬 [OverlayHome] 收起请求（来源=$source）: phase=$_panelAnimPhase, '
+      'controller=${_controller.state.name}',
+    );
     if (_panelAnimPhase == _PanelAnimPhase.collapsing) {
       // 收起动画中重复触发 → 忽略（面板已 IgnorePointer，此处兜底）
+      log('🎬 [OverlayHome] 收起忽略（来源=$source）：已在收起动画中');
       return;
     }
     if (_controller.isCollapsed) {
       // 稳定收起态重复收起 → 幂等
+      log(
+        '🎬 [OverlayHome] 收起忽略（来源=$source）：已是收起态'
+        '（${_controller.state.name}）',
+      );
       return;
     }
     // 收起即停播放：收起后窗口只剩把手，没有任何暂停按钮，继续响会失控
     //（用户已确认此行为；_stopAudioPlayback 幂等，未播放时零成本）
     _stopAudioPlayback();
+    // 滑动删除撤销槽位落定：收起即放弃撤销（收起后胶囊被 IgnorePointer
+    // 挡住点不到，继续挂窗没有意义），补删录音文件
+    _finalizePendingSwipeDelete();
+    // 大爆炸层随面板收起关闭（模态附属于展开面板，不留孤儿模态层）
+    _bigBangText = null;
     // 信号器随本轮收起创建；上一轮残留的未消费信号先放行（防串轮：新一轮
     // 收起开始，旧等待方关心的"窗口不挡触摸"已无意义或即将由本轮重现）
     _collapseSettled?.complete();
@@ -1598,15 +1905,22 @@ class _OverlayHomeState extends State<OverlayHome>
       _panelAnimPhase = _PanelAnimPhase.collapsing;
     });
     _panelAnim.reverse();
+    log('🎬 [OverlayHome] 收起动画已启动（reverse，来源=$source）');
   }
 
   /// 原生 hideOverlay 后的复位（收到 "reset" 消息）：
   /// 取消自动隐藏计时 + 回到收起态，避免下次 showOverlay 首帧残留展开态
   /// （controller.expand() 幂等不触发 notifyListeners → resize 永远不被调 → 卡把手尺寸）
   void _resetFromNative() {
+    log(
+      '🔄 [OverlayHome] 收到原生 reset（窗口已移除）→ 状态复位: '
+      'controller=${_controller.state.name}, phase=$_panelAnimPhase',
+    );
     // 浮窗已彻底隐藏（窗口被原生移除）：停止回放，无窗口不放声。
     // fire-and-forget 即可，方法本身同步语义不变
     _stopAudioPlayback();
+    // 滑动删除撤销槽位落定：窗口被移除后撤销胶囊不可见，补删录音文件
+    _finalizePendingSwipeDelete();
     // 停靠侧异步补读：下次召唤由 Kotlin 建窗按新侧落位，Dart 镜像要在
     // 那之前就位（fire-and-forget，窗口已隐藏期间有整段缓冲时间）
     _refreshOverlayConfig();
@@ -1623,8 +1937,17 @@ class _OverlayHomeState extends State<OverlayHome>
     // 清 Pro 提示态：提示窗已被原生移除（3 秒收窗/用户 toggle/destroy 任一路径
     // 都经 hideOverlay → reset），残留会让下个会话误渲染提示胶囊
     _proHintShown = false;
+    // 清大爆炸层：窗口已移除，模态随会话作废
+    _bigBangText = null;
     // 清空白守卫：复位后渲染把手（并作废 _expand/_finishCollapse 的 await 续段）
     _metricsStage = _MetricsStage.idle;
+    // 清 resize 落地检测基准 + 置位移除标记：基准只对同一窗口会话有效，陈旧
+    // 基准会把下个会话首帧误判"resize 已落地"提前摘守卫，展开链路中断卡把手
+    // 尺寸。只清 null 不够——本方法触发的尾帧 build（下方 collapse 的 setState）
+    // metrics 仍是移除前旧尺寸，会把陈旧值当场记回基准，必须同时拦记录
+    //（防再犯说明见 _lastWindowConstraints / _windowRemoved 字段注释）
+    _lastWindowConstraints = null;
+    _windowRemoved = true;
     // 收起中断于窗口移除：放行等待方（窗口已被原生移除必然不挡授权框，
     // 不用等超时兜底）
     _collapseSettled?.complete();
@@ -1684,24 +2007,55 @@ class _OverlayHomeState extends State<OverlayHome>
       final theme = OverlayConstants.parseHandleTheme(
         prefs.getString(OverlayConstants.handleThemePrefKey),
       );
+      final fontStep = OverlayConstants.parseFontSizeStep(
+        prefs.getInt(OverlayConstants.fontSizeStepPrefKey),
+      );
+      final edgeLineMargin = OverlayConstants.parseEdgeLineMargin(
+        prefs.getInt(OverlayConstants.edgeLineMarginPrefKey),
+      );
+      final panelMaxCards = OverlayConstants.parsePanelMaxCards(
+        prefs.getInt(OverlayConstants.panelMaxCardsPrefKey),
+      );
       if (!mounted) return;
       final sideChanged = left != _sideLeft;
       final sizeChanged = size != _handleSizePercent;
       final themeChanged = theme != _handleTheme;
-      if (!sideChanged && !sizeChanged && !themeChanged) return;
+      final fontStepChanged = fontStep != _fontSizeStep;
+      final edgeLineMarginChanged = edgeLineMargin != _edgeLineMarginDp;
+      final panelMaxCardsChanged = panelMaxCards != _panelMaxCards;
+      if (!sideChanged &&
+          !sizeChanged &&
+          !themeChanged &&
+          !fontStepChanged &&
+          !edgeLineMarginChanged &&
+          !panelMaxCardsChanged) {
+        return;
+      }
       setState(() {
         _sideLeft = left;
         _handleSizePercent = size;
         _handleTheme = theme;
+        _fontSizeStep = fontStep;
+        _edgeLineMarginDp = edgeLineMargin;
+        _panelMaxCards = panelMaxCards;
       });
       if (sideChanged) {
-        print('🧭 [OverlayHome] 停靠侧已刷新: ${left ? '左缘' : '右缘'}');
+        log('🧭 [OverlayHome] 停靠侧已刷新: ${left ? '左缘' : '右缘'}');
       }
       if (sizeChanged) {
-        print('🫧 [OverlayHome] 把手大小已刷新: $size%');
+        log('🫧 [OverlayHome] 把手大小已刷新: $size%');
       }
       if (themeChanged) {
-        print('🎨 [OverlayHome] 把手主题已刷新: ${theme.name}');
+        log('🎨 [OverlayHome] 把手主题已刷新: ${theme.name}');
+      }
+      if (fontStepChanged) {
+        log('🔤 [OverlayHome] 字体大小档位已刷新: $fontStep');
+      }
+      if (edgeLineMarginChanged) {
+        log('📏 [OverlayHome] 竖线边距档位已刷新: ${edgeLineMargin}dp');
+      }
+      if (panelMaxCardsChanged) {
+        log('📐 [OverlayHome] 面板高度档位已刷新: $panelMaxCards 条');
       }
     } catch (_) {
       // 读配置失败按当前值兜底，不阻塞悬浮窗流程
@@ -1716,10 +2070,14 @@ class _OverlayHomeState extends State<OverlayHome>
   Future<void> _scheduleAutoHide() async {
     // 录音/转写期间不自动隐藏（胶囊/转写 UI 常驻，中途消失会丢 UI 反馈）；
     // 转写完成切面板后，收起时才恢复计时。generation 竞态机制不受影响
-    if (_voiceMemo.state != OverlayVoiceMemoState.idle) return;
+    if (_voiceMemo.state != OverlayVoiceMemoState.idle) {
+      log('⏲️ [OverlayHome] 自动隐藏排定跳过：语音速记状态=${_voiceMemo.state.name}');
+      return;
+    }
     final generation = ++_hideScheduleGeneration;
     var seconds = OverlayConstants.autoHideDefaultSeconds;
     var edgeLineEnabled = true;
+    var prefsOk = true;
     try {
       final prefs = await SharedPreferences.getInstance();
       // 跨 engine 读主 App 新写的值（各 engine 的 prefs 内存缓存隔离，必须 reload）
@@ -1735,32 +2093,82 @@ class _OverlayHomeState extends State<OverlayHome>
           prefs.getBool(OverlayConstants.overlaySideLeftPrefKey) ?? false;
       if (mounted && left != _sideLeft) {
         setState(() => _sideLeft = left);
-        print('🧭 [OverlayHome] 停靠侧已刷新: ${left ? '左缘' : '右缘'}');
+        log('🧭 [OverlayHome] 停靠侧已刷新: ${left ? '左缘' : '右缘'}');
       }
       final size = OverlayConstants.parseHandleSizePercent(
         prefs.getInt(OverlayConstants.handleSizePrefKey),
       );
       if (mounted && size != _handleSizePercent) {
         setState(() => _handleSizePercent = size);
-        print('🫧 [OverlayHome] 把手大小已刷新: $size%');
+        log('🫧 [OverlayHome] 把手大小已刷新: $size%');
       }
       final theme = OverlayConstants.parseHandleTheme(
         prefs.getString(OverlayConstants.handleThemePrefKey),
       );
       if (mounted && theme != _handleTheme) {
         setState(() => _handleTheme = theme);
-        print('🎨 [OverlayHome] 把手主题已刷新: ${theme.name}');
+        log('🎨 [OverlayHome] 把手主题已刷新: ${theme.name}');
       }
-    } catch (_) {
+      final fontStep = OverlayConstants.parseFontSizeStep(
+        prefs.getInt(OverlayConstants.fontSizeStepPrefKey),
+      );
+      if (mounted && fontStep != _fontSizeStep) {
+        setState(() => _fontSizeStep = fontStep);
+        log('🔤 [OverlayHome] 字体大小档位已刷新: $fontStep');
+      }
+      final edgeLineMargin = OverlayConstants.parseEdgeLineMargin(
+        prefs.getInt(OverlayConstants.edgeLineMarginPrefKey),
+      );
+      if (mounted && edgeLineMargin != _edgeLineMarginDp) {
+        setState(() => _edgeLineMarginDp = edgeLineMargin);
+        log('📏 [OverlayHome] 竖线边距档位已刷新: ${edgeLineMargin}dp');
+      }
+      final panelMaxCards = OverlayConstants.parsePanelMaxCards(
+        prefs.getInt(OverlayConstants.panelMaxCardsPrefKey),
+      );
+      if (mounted && panelMaxCards != _panelMaxCards) {
+        setState(() => _panelMaxCards = panelMaxCards);
+        log('📐 [OverlayHome] 面板高度档位已刷新: $panelMaxCards 条');
+      }
+    } catch (e) {
       // 读配置失败按默认 10 秒/开关开/当前侧兜底，不阻塞隐藏流程
+      prefsOk = false;
+      log('⚠️ [OverlayHome] 自动隐藏读配置失败，按默认值兜底: $e');
     }
-    if (generation != _hideScheduleGeneration) return; // await 期间用户又展开了
-    if (!_controller.isCollapsed) return; // 双保险：非收起态不隐藏
+    log(
+      '⏲️ [OverlayHome] 自动隐藏配置: seconds=$seconds, '
+      '竖线开关=$edgeLineEnabled, prefs读取${prefsOk ? '成功' : '失败'}',
+    );
+    if (generation != _hideScheduleGeneration) {
+      log(
+        '⏲️ [OverlayHome] 自动隐藏排定作废：await 期间又有展开/收起'
+        '（gen $generation != $_hideScheduleGeneration）',
+      );
+      return; // await 期间用户又展开了
+    }
+    if (!_controller.isCollapsed) {
+      log(
+        '⏲️ [OverlayHome] 自动隐藏排定跳过：非收起态'
+        '（${_controller.state.name}）',
+      );
+      return; // 双保险：非收起态不隐藏
+    }
     // 「永久」：收起态把手常驻，不彻底隐藏（展开/收起链路无需感知，本方法
     // 每次收起都会被重新调用，改回限时档自然恢复计时）
-    if (seconds == OverlayConstants.autoHideNeverSeconds) return;
+    if (seconds == OverlayConstants.autoHideNeverSeconds) {
+      log('⏲️ [OverlayHome] 自动隐藏「永久」档：把手常驻，不起计时');
+      return;
+    }
+    log(
+      '⏲️ [OverlayHome] 自动隐藏计时已排定：$seconds 秒后'
+      '${edgeLineEnabled ? '缩成贴边竖线' : '彻底隐藏（closeOverlay）'}',
+    );
     _autoHideTimer = Timer(Duration(seconds: seconds), () {
       _autoHideTimer = null;
+      log(
+        '⏲️ [OverlayHome] 自动隐藏计时到期：竖线开关=$edgeLineEnabled, '
+        'controller=${_controller.state.name}',
+      );
       if (edgeLineEnabled) {
         _enterEdgeLine(); // 缩成贴边竖线驻留，不再移除窗口
       } else {
@@ -1782,6 +2190,10 @@ class _OverlayHomeState extends State<OverlayHome>
   /// 朝屏内滑或音量键 expand（直接进面板，线态随 controller.expand() 自然
   /// 消失）/_resetFromNative（窗口移除后 controller.collapse() 归把手态）
   void _enterEdgeLine() {
+    log(
+      '🎬 [OverlayHome] 进入线态请求: mounted=$mounted, '
+      'voiceMemo=${_voiceMemo.state.name}, controller=${_controller.state.name}',
+    );
     if (!mounted) return;
     // 防御：录音/转写中不进线态（录音分支已取消计时器，此处双保险）；
     // 非收起态/已是线态不重复进（幂等）
@@ -1792,15 +2204,18 @@ class _OverlayHomeState extends State<OverlayHome>
     });
     // → notifyListeners → _onStateChanged resize(edgeLineWindowWidth, edgeLineHeight)
     _controller.enterEdgeLine();
-    print('🎬 [OverlayHome] 自动隐藏到期 → 缩成贴边竖线驻留');
+    log('🎬 [OverlayHome] 自动隐藏到期 → 缩成贴边竖线驻留');
   }
 
-  /// 息屏立即推进到驻留终态（Kotlin ACTION_SCREEN_OFF 转发，2026-09-22 用户
-  /// 拍板「进 AOD 必须收」）：面板/把手不再等自动隐藏计时，立即按「隐藏后保留
-  /// 贴边竖线」开关分流——开 → 缩成贴边竖线（亮屏/解锁后只会看到竖线，把手/
-  /// 面板不复活）；关 → closeOverlay 彻底移除窗口。「永久」档
-  /// （overlay_auto_hide_seconds=-1）在此不生效——它只管亮屏期间的常驻，
-  /// 息屏推进无条件（AOD 防残留是硬需求）。
+  /// 息屏处理（Kotlin ACTION_SCREEN_OFF 转发）：先把展开面板跳终态收回
+  /// 把手（面板永不穿越息屏），再按 [OverlayConstants.screenOffActionFor]
+  /// 分流——「永久」档（overlay_auto_hide_seconds=autoHideNeverSeconds）
+  /// 把手驻留穿越 AOD：息屏期间窗口由 Kotlin 置 GONE 保干净，亮屏 VISIBLE
+  /// 把手原样回来，不推进竖线/移除（2026-09-28 用户拍板，推翻 09-22
+  /// 「永久档息屏不生效」旧语义——永久=把手一直在，竖线开关在永久档下对
+  /// 息屏同样不生效）；限时档维持 09-22「进 AOD 必须收」：按「隐藏后保留
+  /// 贴边竖线」开关分流——开 → 缩成贴边竖线（亮屏/解锁后只会看到竖线）；
+  /// 关 → closeOverlay 彻底移除窗口。
   ///
   /// 为什么跳终态而不走 _collapse 推屏动画：息屏后窗口已被 Kotlin 置 GONE、
   /// vsync 停、AnimationController 不跑，等 dismissed 边界回调会卡到亮屏才
@@ -1814,6 +2229,10 @@ class _OverlayHomeState extends State<OverlayHome>
   /// 同 _openDiaryPage 先例），写库失败留在编辑态放弃收起，不丢用户输入。
   Future<void> _onScreenAutoHide() async {
     if (!mounted) return;
+    log(
+      '🌙 [OverlayHome] 息屏推进驻留终态: '
+      'controller=${_controller.state.name}, phase=$_panelAnimPhase',
+    );
     if (_voiceMemo.state != OverlayVoiceMemoState.idle) return;
     // 作废挂起的自动隐藏计时：下面的推进即刻到位，遗留 Timer 到期只会撞上
     // 幂等守卫空转（_enterEdgeLine 幂等/closeOverlay 空窗 no-op），主动取消防串
@@ -1839,23 +2258,35 @@ class _OverlayHomeState extends State<OverlayHome>
       _controller.collapse(); // → resize(28,88)；紧接着的驻留分流再缩到 20×64
     }
     var edgeLineEnabled = true;
+    var autoHideSeconds = OverlayConstants.autoHideDefaultSeconds;
     try {
       final prefs = await SharedPreferences.getInstance();
       // 跨 engine 读主 App 新写的值（各 engine prefs 内存缓存隔离，必须 reload）
       await prefs.reload();
       edgeLineEnabled =
           prefs.getBool(OverlayConstants.edgeLineEnabledPrefKey) ?? true;
+      autoHideSeconds =
+          prefs.getInt('overlay_auto_hide_seconds') ??
+          OverlayConstants.autoHideDefaultSeconds;
     } catch (_) {
-      // 读失败按开启兜底（同 _scheduleAutoHide），不阻塞息屏推进
+      // 读失败按「限时档 + 竖线开」兜底（同 _scheduleAutoHide），不阻塞息屏推进
     }
     if (!mounted) return;
-    if (edgeLineEnabled) {
-      _enterEdgeLine(); // 幂等：已线态（isEdgeLine）/非收起态 no-op
-      print('🌙 [OverlayHome] 息屏 → 缩成贴边竖线驻留');
-    } else {
-      // → 原生 hideOverlay → 发 reset 复位 Dart 状态（见 _resetFromNative）
-      await AccessibilityOverlay.closeOverlay();
-      print('🌙 [OverlayHome] 息屏 → 彻底移除悬浮窗（贴边竖线开关关）');
+    switch (OverlayConstants.screenOffActionFor(
+      autoHideSeconds,
+      edgeLineEnabled: edgeLineEnabled,
+    )) {
+      case ScreenOffAction.keepHandle:
+        // 永久档把手驻留穿越 AOD：展开面板已在上面跳终态收回把手，息屏期间
+        // 窗口由 Kotlin 置 GONE，亮屏 VISIBLE 把手原样回来，这里不动状态
+        log('🌙 [OverlayHome] 息屏 → 永久档把手驻留，穿越 AOD 不推进');
+      case ScreenOffAction.enterEdgeLine:
+        _enterEdgeLine(); // 幂等：已线态（isEdgeLine）/非收起态 no-op
+        log('🌙 [OverlayHome] 息屏 → 缩成贴边竖线驻留');
+      case ScreenOffAction.closeOverlay:
+        // → 原生 hideOverlay → 发 reset 复位 Dart 状态（见 _resetFromNative）
+        await AccessibilityOverlay.closeOverlay();
+        log('🌙 [OverlayHome] 息屏 → 彻底移除悬浮窗（贴边竖线开关关）');
     }
   }
 
@@ -1872,14 +2303,15 @@ class _OverlayHomeState extends State<OverlayHome>
           // Pro 未解锁提示态（最优先）：Kotlin 门禁拦截后直建 312×84 隐藏窗通知
           // 渲染提示胶囊，首帧构建完发揭示信号（复用 voiceMemoUiReady 消息，
           // Kotlin 对提示窗保持 FLAG_NOT_TOUCHABLE），3 秒后 Kotlin 收窗。
-          // ⚠️ 必须排在揭示门与「84<88 硬不变量」判定之前——提示态 voiceMemo
-          // 仍 idle、窗口高 84<88，不短路会先被揭示门/硬不变量渲染成空白。
+          // ⚠️ 必须排在揭示门与胶囊高度硬不变量判定之前——提示态 voiceMemo
+          // 仍 idle、窗口高 84 属胶囊高度档，不短路会先被揭示门/硬不变量渲染成空白。
           // postFrame 重复注册无害：Kotlin 揭示后 pendingVoiceMemoReveal=false，
           // 重复的 voiceMemoUiReady 是 no-op
           if (_proHintShown) {
             WidgetsBinding.instance.addPostFrameCallback((_) {
               AccessibilityOverlay.voiceMemoUiReady();
             });
+            _markBuildBranch('Pro提示');
             return ProLockedHintPill(dockLeft: _sideLeft);
           }
           // 揭示门短路：挂门期间渲染纯透明空白（把手/胶囊像素不进帧）。
@@ -1896,6 +2328,7 @@ class _OverlayHomeState extends State<OverlayHome>
               });
               // 不 return——本帧直接落到下方语音速记分支渲染胶囊
             } else {
+              _markBuildBranch('揭示门空白');
               return const SizedBox.shrink();
             }
           }
@@ -1903,16 +2336,22 @@ class _OverlayHomeState extends State<OverlayHome>
           // 窗口里。语音速记冷启动窗口从创建起就是 312×84，engine attach 瞬间
           // / startVoiceMemo 到达前的 pre-gate 帧（state 仍 idle）在此渲染空白，
           // 把手像素物理上不存在于该路径的任何一帧。
-          // 线态例外：贴边竖线窗口同为 64dp 高（4×64），是合法驻留态
+          // 线态例外：贴边竖线窗口同为 64dp 高（4×64），是合法驻留态。
+          // ⚠️ 判定必须走 isCapsuleHeightWindow（阈值=两设计高度中点 86），不能
+          // 直接 < handleHeight：dpToPx 取整会让把手窗实测小于 88（density
+          // 2.8125 机器实测 87.8），把手被自己误杀成空白（真机反馈，详见
+          // docs/architecture/floating-window.md「硬不变量高度误判」）
           if (_voiceMemo.state == OverlayVoiceMemoState.idle &&
               !_controller.isEdgeLine &&
-              constraints.maxHeight < OverlayConstants.handleHeight) {
+              OverlayConstants.isCapsuleHeightWindow(constraints.maxHeight)) {
+            _markBuildBranch('硬不变量空白');
             return const SizedBox.shrink();
           }
           // 语音速记（录音/转写）优先于把手/面板分支——此时窗口已被 resize 成胶囊尺寸，
           // 把手（28×88）和全屏面板都不该渲染（语音进入时 _onVoiceMemoChanged 会清
           // 空白守卫，此分支不会被守卫误吞）
           if (_voiceMemo.state != OverlayVoiceMemoState.idle) {
+            _markBuildBranch('语音胶囊');
             return OverlayVoiceMemoBar(
               controller: _voiceMemo,
               dockLeft: _sideLeft,
@@ -1921,8 +2360,16 @@ class _OverlayHomeState extends State<OverlayHome>
           // 空白守卫：resize 落地前的所有帧渲染纯透明（见 _MetricsStage 注释），
           // 旧纹理重投影到新窗口时不可见——这是消除巨型把手/左上角飞闪的关键
           if (_metricsStage == _MetricsStage.awaitingResize) {
+            _markBuildBranch('resize空白守卫');
             return const SizedBox.expand();
           }
+          _markBuildBranch(
+            _controller.isEdgeLine
+                ? '贴边竖线'
+                : _controller.isCollapsed
+                ? '把手'
+                : '展开面板',
+          );
           final content = _controller.isEdgeLine
               // 线态：贴边半透明竖线（窗口即线宽 4×64，无 Align 需求）
               ? _buildEdgeLine()
@@ -1975,7 +2422,7 @@ class _OverlayHomeState extends State<OverlayHome>
         // 标准 AOSP 映射 TICK<HEAVY_CLICK 的机型上两档体感会反转）。
         // 设计意图不变：把手显眼轻确认、竖线隐形重确认。点按展开刻意不震：
         // 点按是有明确视觉目标的确认操作，滑动是"盲手势"需要触感兜底
-        print('🫧 [OverlayHome] 把手滑动展开 → performHaptic(heavy/轻档)');
+        log('🫧 [OverlayHome] 把手滑动展开 → performHaptic(heavy/轻档)');
         AccessibilityOverlay.performHaptic('heavy');
         _expand();
       },
@@ -2052,7 +2499,7 @@ class _OverlayHomeState extends State<OverlayHome>
           // ⚠️ 档位看似反直觉（竖线用 tick、把手用 heavy）：小米 15 HyperOS
           // 实测 EFFECT_TICK 体感比 EFFECT_HEAVY_CLICK 重（对调依据见
           // _buildHandle 注释）——tick 档在该机即"重档"
-          print('🫧 [OverlayHome] 竖线滑动展开 → performHaptic(tick/重档)');
+          log('🫧 [OverlayHome] 竖线滑动展开 → performHaptic(tick/重档)');
           AccessibilityOverlay.performHaptic('tick');
           _expand();
         }
@@ -2064,29 +2511,38 @@ class _OverlayHomeState extends State<OverlayHome>
       // 位置都算按中（4dp 难触发的修复，见常量注释）
       child: Align(
         alignment: _sideLeft ? Alignment.centerLeft : Alignment.centerRight,
-        child: Container(
-          width: OverlayConstants.edgeLineWidth,
-          height: OverlayConstants.edgeLineVisualHeight(_handleSizePercent),
-          decoration: BoxDecoration(
-            // 明暗渐变：屏内端深灰 → 贴缘端浅灰（随停靠侧镜像）——白底看
-            // 深端、黑底看浅端，任何背景至少一端可见（旧单一半透明白在
-            // 白底上不可见；用户拍板方案 D，见 edgeLineGradient* 常量注释）
-            gradient: LinearGradient(
-              begin: Alignment.centerLeft,
-              end: Alignment.centerRight,
-              colors: _sideLeft
-                  ? [
-                      OverlayConstants.edgeLineGradientLight,
-                      OverlayConstants.edgeLineGradientDeep,
-                    ]
-                  : [
-                      OverlayConstants.edgeLineGradientDeep,
-                      OverlayConstants.edgeLineGradientLight,
-                    ],
-            ),
-            // 全圆角：半径 = 宽度一半（4dp → 2dp），两端圆头细线
-            borderRadius: BorderRadius.circular(
-              OverlayConstants.edgeLineWidth / 2,
+        // 靠边侧内边距 = 竖线内移间距档位（贴黑边钢化膜防遮挡，2026-09-29）：
+        // 纯视觉内移，窗口 20×64 与触摸缓冲区不动（见 edgeLineMarginPrefKey
+        // 常量注释——上限 16 = 窗口宽 20 − 线宽 4）
+        child: Padding(
+          padding: OverlayConstants.edgeLinePadding(
+            sideLeft: _sideLeft,
+            marginDp: _edgeLineMarginDp,
+          ),
+          child: Container(
+            width: OverlayConstants.edgeLineWidth,
+            height: OverlayConstants.edgeLineVisualHeight(_handleSizePercent),
+            decoration: BoxDecoration(
+              // 明暗渐变：屏内端深灰 → 贴缘端浅灰（随停靠侧镜像）——白底看
+              // 深端、黑底看浅端，任何背景至少一端可见（旧单一半透明白在
+              // 白底上不可见；用户拍板方案 D，见 edgeLineGradient* 常量注释）
+              gradient: LinearGradient(
+                begin: Alignment.centerLeft,
+                end: Alignment.centerRight,
+                colors: _sideLeft
+                    ? [
+                        OverlayConstants.edgeLineGradientLight,
+                        OverlayConstants.edgeLineGradientDeep,
+                      ]
+                    : [
+                        OverlayConstants.edgeLineGradientDeep,
+                        OverlayConstants.edgeLineGradientLight,
+                      ],
+              ),
+              // 全圆角：半径 = 宽度一半（4dp → 2dp），两端圆头细线
+              borderRadius: BorderRadius.circular(
+                OverlayConstants.edgeLineWidth / 2,
+              ),
             ),
           ),
         ),
@@ -2099,6 +2555,7 @@ class _OverlayHomeState extends State<OverlayHome>
   /// 近乎隐形，点按是"轻唤醒"：先把显眼的把手唤出来，是否展开面板交给用户
   /// 下一步决定。点按不震（有明确视觉目标，同把手点按展开不震的定夺）
   Future<void> _onEdgeLineTap() async {
+    log('👆 [OverlayHome] 点按贴边竖线');
     var tapEnabled = true;
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -2110,7 +2567,7 @@ class _OverlayHomeState extends State<OverlayHome>
       // 读配置失败按开启兜底（与缺省值一致，不阻塞点按）
     }
     if (!tapEnabled) {
-      print('🎬 [OverlayHome] 点按竖线：开关已关，忽略（仅侧滑/音量键可展开）');
+      log('🎬 [OverlayHome] 点按竖线：开关已关，忽略（仅侧滑/音量键可展开）');
       return;
     }
     await _exitEdgeLine();
@@ -2124,6 +2581,7 @@ class _OverlayHomeState extends State<OverlayHome>
   Future<void> _exitEdgeLine() async {
     if (!mounted) return;
     if (!_controller.isEdgeLine) return;
+    log('🔙 [OverlayHome] 退出线态回把手：挂空白守卫，等透明帧呈现…');
     setState(() {
       _metricsStage = _MetricsStage.awaitingResize;
     });
@@ -2131,12 +2589,16 @@ class _OverlayHomeState extends State<OverlayHome>
     if (!mounted ||
         !_controller.isEdgeLine ||
         _metricsStage != _MetricsStage.awaitingResize) {
+      log(
+        '⛔ [OverlayHome] 退出线态被中断: '
+        'mounted=$mounted, isEdgeLine=${_controller.isEdgeLine}, stage=$_metricsStage',
+      );
       return; // 等待期间被 reset/语音/展开打断（清守卫或状态变化即中断信号）
     }
     // → notifyListeners → _onStateChanged resize(28,88)
     _controller.exitEdgeLine();
     _scheduleAutoHide(); // 把手态排定自动隐藏（必须在 exitEdgeLine 之后）
-    print('🎬 [OverlayHome] 点按贴边竖线 → 回把手 + 排定自动隐藏');
+    log('🎬 [OverlayHome] 点按贴边竖线 → 回把手 + 排定自动隐藏');
   }
 
   /// 展开态：全屏窗口 + 贴停靠侧的自适应面板
@@ -2149,8 +2611,10 @@ class _OverlayHomeState extends State<OverlayHome>
   /// 比例唯一真值在 [OverlayConstants.expandedWidthRatio]）。面板高度随日记
   /// 条数自适应：Column 收缩到内容高度（mainAxisSize.min），列表用
   /// Flexible + shrinkWrap + ConstrainedBox 限高——条目少时面板只包住卡片；
-  /// 条目多时列表区域限高约 maxVisibleDiaryCards 张卡高度
-  ///（panelListMaxHeight），超出内部滚动；矮屏再被窗口高度约束。
+  /// 条目多时列表区域限高按「面板高度」档位（可见条数 _panelMaxCards，
+  /// panelListMaxHeightFor）计算，超出内部滚动；矮屏再被窗口高度约束。
+  /// 档位低于默认时外层 Padding 给面板顶部下压等量偏移（panelTopOffsetFor，
+  /// 每少 1 条下压一张卡高）——整列底边位置不变、顶部按钮组下移进拇指区。
   /// 面板背景透明（无背景色与阴影——透明背景上留 boxShadow 会画出奇怪的
   /// 阴影框），层次感由卡片自身阴影提供。
   Widget _buildPanel(AppThemeExtension ext) {
@@ -2188,329 +2652,419 @@ class _OverlayHomeState extends State<OverlayHome>
             // tick 只重建 transform/opacity 层，不重建 ListView
             Align(
               alignment: _sideLeft ? Alignment.topLeft : Alignment.topRight,
-              child: AnimatedBuilder(
-                animation: _panelAnimCurve,
-                // 动画中禁点面板（防滑出途中误触卡片/按钮）；phase 变化总伴随
-                // setState → child 随整体 rebuild 重建，ignoring 即时生效
-                child: IgnorePointer(
-                  ignoring: _panelAnimPhase != _PanelAnimPhase.idle,
-                  // 面板区域朝停靠边缘滑动收起：停靠右缘 = 右滑（+x，历史
-                  // 行为）、停靠左缘 = 左滑（镜像）。与空白区的"任意方向"
-                  // 语义不同是有意的——面板内朝屏内侧滑无含义，放开易误触。
-                  // 水平 drag 与 ListView 垂直滚动方向不同，
-                  // 手势竞技场天然并存互不干扰
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.translucent, // 卡片间隙也能命中
-                    onHorizontalDragUpdate: (details) {
-                      // 编辑态手势降级：滑动只收起键盘，不标记待收起
-                      if (_dismissKeyboardIfEditing()) return;
-                      if (OverlayConstants.swipeExceeds(
-                        details.primaryDelta,
-                        towardLeft: _sideLeft,
-                      )) {
-                        _willCollapse = true;
-                      }
-                    },
-                    onHorizontalDragEnd: (_) {
-                      // 编辑态手势降级：松手只收起键盘，不收起面板
-                      if (_dismissKeyboardIfEditing()) return;
-                      if (_willCollapse) {
-                        _willCollapse = false;
-                        _collapse();
-                      }
-                    },
-                    onHorizontalDragCancel: () => _willCollapse = false,
-                    // AnimatedContainer 补间面板宽度（有卡展开 0.72→0.92 平滑加宽）
-                    child: AnimatedContainer(
-                      duration: OverlayConstants.animationDuration,
-                      width: panelWidth,
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          // 顶部按钮条（深色半透明工具条）+ 日记列表
-                          _buildHeader(),
-                          // 日记列表：条目少时收缩到内容高度，条目多时占满剩余空间内部滚动
-                          Flexible(
-                            child: _loading
-                                ? const Center(
-                                    child: CircularProgressIndicator(),
-                                  )
-                                : _error
-                                ? _buildErrorView(ext)
-                                : _diaries.isEmpty
-                                ? _buildEmptyView(ext)
-                                // 区域限高约 maxVisibleDiaryCards 张卡高度，超出内部滚动
-                                : ConstrainedBox(
-                                    constraints: const BoxConstraints(
-                                      maxHeight:
-                                          OverlayConstants.panelListMaxHeight,
-                                    ),
-                                    child: ListView.builder(
-                                      // 高度收缩到内容（配合外层 ConstrainedBox+Flexible
-                                      // 实现：条目少收缩自适应，条目多限高内滚动）
-                                      shrinkWrap: true,
-                                      // 底部避让导航栏区域
-                                      padding: const EdgeInsets.only(
-                                        top: 8,
-                                        bottom: 48,
-                                      ),
-                                      itemCount: _diaries.length,
-                                      itemBuilder: (context, index) {
-                                        final diary = _diaries[index];
-                                        final id = diary['id'] as int;
-                                        final isArchived =
-                                            (diary['is_archived'] as int? ??
-                                                0) ==
-                                            1;
-                                        // 已归档分隔线：当前条目已归档且上一条未归档
-                                        //（依赖 getDiaries 排序 is_archived ASC,
-                                        //  created_at DESC，复刻主 App diary_tab 分隔线模式）
-                                        Widget? archivedSeparator;
-                                        if (isArchived &&
-                                            index > 0 &&
-                                            (_diaries[index - 1]['is_archived']
-                                                        as int? ??
-                                                    0) !=
-                                                1) {
-                                          // 透明面板上用白色半透明（主 App 的 ext.textHint
-                                          // 在壁纸背景上不可读）
-                                          archivedSeparator = Padding(
-                                            // 上下间距：分隔线在上、卡片 margin bottom 10 已有
-                                            padding: const EdgeInsets.only(
-                                              top: 12,
-                                              bottom: 4,
+              // 面板高度档位：可见条数低于默认档时顶部下压等量偏移（每少 1 条
+              // 下压一张卡高，panelTopOffsetFor）——面板是顶部锚定布局，只缩
+              // 列表限高只会让底边上移、顶部按钮原地不动（够不着的问题依旧）；
+              // 配下压偏移才兑现「整列底边位置不变、顶部按钮组下移进拇指区」。
+              // Padding 在 Align 约束内缩小可用高度，Column 的 Flexible 列表
+              // 仍被窗口剩余高度约束，矮屏不溢出
+              child: Padding(
+                padding: EdgeInsets.only(
+                  top: OverlayConstants.panelTopOffsetFor(_panelMaxCards),
+                ),
+                child: AnimatedBuilder(
+                  animation: _panelAnimCurve,
+                  // 动画中禁点面板（防滑出途中误触卡片/按钮）；phase 变化总伴随
+                  // setState → child 随整体 rebuild 重建，ignoring 即时生效
+                  child: IgnorePointer(
+                    ignoring: _panelAnimPhase != _PanelAnimPhase.idle,
+                    // 面板区域朝停靠边缘滑动收起：停靠右缘 = 右滑（+x，历史
+                    // 行为）、停靠左缘 = 左滑（镜像）。与空白区的"任意方向"
+                    // 语义不同是有意的——面板内朝屏内侧滑无含义，放开易误触。
+                    // 水平 drag 与 ListView 垂直滚动方向不同，
+                    // 手势竞技场天然并存互不干扰
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.translucent, // 卡片间隙也能命中
+                      onHorizontalDragUpdate: (details) {
+                        // 编辑态手势降级：滑动只收起键盘，不标记待收起
+                        if (_dismissKeyboardIfEditing()) return;
+                        if (OverlayConstants.swipeExceeds(
+                          details.primaryDelta,
+                          towardLeft: _sideLeft,
+                        )) {
+                          _willCollapse = true;
+                        }
+                      },
+                      onHorizontalDragEnd: (_) {
+                        // 编辑态手势降级：松手只收起键盘，不收起面板
+                        if (_dismissKeyboardIfEditing()) return;
+                        if (_willCollapse) {
+                          _willCollapse = false;
+                          _collapse(source: '面板朝缘滑动');
+                        }
+                      },
+                      onHorizontalDragCancel: () => _willCollapse = false,
+                      // AnimatedContainer 补间面板宽度（有卡展开 0.72→0.92 平滑加宽）
+                      child: AnimatedContainer(
+                        duration: OverlayConstants.animationDuration,
+                        width: panelWidth,
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            // 顶部按钮条（深色半透明工具条）+ 日记列表
+                            _buildHeader(),
+                            // 滑动删除撤销胶囊（「滑动直接删除」开关开启后，
+                            // 活跃卡划走删除时在窗口内出现，点「撤销」还原；
+                            // 槽位落定/清空即消失）
+                            if (_pendingSwipeDelete != null)
+                              UndoDeletePill(
+                                onUndo: _undoSwipeDelete,
+                                fontSizeStep: _fontSizeStep,
+                                dockLeft: _sideLeft,
+                              ),
+                            // 日记列表：条目少时收缩到内容高度，条目多时占满剩余空间内部滚动
+                            Flexible(
+                              child: _loading
+                                  ? const Center(
+                                      child: CircularProgressIndicator(),
+                                    )
+                                  : _error
+                                  ? _buildErrorView(ext)
+                                  : _diaries.isEmpty
+                                  ? _buildEmptyView(ext)
+                                  // 区域限高按面板高度档位（可见条数）计算，
+                                  // 超出内部滚动；顶部下压偏移见外层 Padding
+                                  : ConstrainedBox(
+                                      constraints: BoxConstraints(
+                                        maxHeight:
+                                            OverlayConstants.panelListMaxHeightFor(
+                                              _panelMaxCards,
                                             ),
-                                            child: Padding(
-                                              // horizontal 14 对齐卡片左右 margin
-                                              padding:
-                                                  const EdgeInsets.symmetric(
-                                                    horizontal: 14,
-                                                  ),
-                                              child: Row(
-                                                children: [
-                                                  Expanded(
-                                                    child: Divider(
-                                                      color: Colors.white
-                                                          .withValues(
-                                                            alpha: 0.45,
-                                                          ),
+                                      ),
+                                      child: ReorderableListView.builder(
+                                        // 高度收缩到内容（配合外层 ConstrainedBox+Flexible
+                                        // 实现：条目少收缩自适应，条目多限高内滚动）
+                                        shrinkWrap: true,
+                                        // 长按拖动排序：拖把手柄关闭默认短按手柄，
+                                        // 由 itemBuilder 内 ReorderableDelayedDragStartListener
+                                        // 按卡片条件包裹（活跃+收起+非编辑中才可拖）
+                                        buildDefaultDragHandles: false,
+                                        // 长按拖起瞬间 tick 震动（悬浮窗触感家族，
+                                        // 与把手/竖线滑动展开同档）
+                                        onReorderStart: (_) =>
+                                            AccessibilityOverlay.performHaptic(
+                                              'tick',
+                                            ),
+                                        // 透明面板禁默认 Material 浮层底色/阴影
+                                        //（面板背景透明，默认 elevation 浮层会画出
+                                        // 白色底块——项目既有教训）
+                                        proxyDecorator:
+                                            (child, index, animation) =>
+                                                Material(
+                                                  type:
+                                                      MaterialType.transparency,
+                                                  child: child,
+                                                ),
+                                        // 内存先行重排 + DB 持久化（见 _onReorderDiary）
+                                        onReorder: _onReorderDiary,
+                                        // 底部避让导航栏区域
+                                        padding: const EdgeInsets.only(
+                                          top: 8,
+                                          bottom: 48,
+                                        ),
+                                        itemCount: _diaries.length,
+                                        itemBuilder: (context, index) {
+                                          final diary = _diaries[index];
+                                          final id = diary['id'] as int;
+                                          final isArchived =
+                                              (diary['is_archived'] as int? ??
+                                                  0) ==
+                                              1;
+                                          // 已归档分隔线：当前条目已归档且上一条未归档
+                                          //（依赖 getDiaries 排序 is_archived ASC,
+                                          //  created_at DESC，复刻主 App diary_tab 分隔线模式）
+                                          Widget? archivedSeparator;
+                                          if (isArchived &&
+                                              index > 0 &&
+                                              (_diaries[index -
+                                                              1]['is_archived']
+                                                          as int? ??
+                                                      0) !=
+                                                  1) {
+                                            // 透明面板上用白色半透明（主 App 的 ext.textHint
+                                            // 在壁纸背景上不可读）
+                                            archivedSeparator = Padding(
+                                              // 上下间距：分隔线在上、卡片 margin bottom 10 已有
+                                              padding: const EdgeInsets.only(
+                                                top: 12,
+                                                bottom: 4,
+                                              ),
+                                              child: Padding(
+                                                // horizontal 14 对齐卡片左右 margin
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                      horizontal: 14,
                                                     ),
-                                                  ),
-                                                  Padding(
-                                                    padding:
-                                                        const EdgeInsets.symmetric(
-                                                          horizontal: 8,
-                                                        ),
-                                                    child: Text(
-                                                      '已归档',
-                                                      style: TextStyle(
-                                                        fontSize: 12,
+                                                child: Row(
+                                                  children: [
+                                                    Expanded(
+                                                      child: Divider(
                                                         color: Colors.white
                                                             .withValues(
-                                                              alpha: 0.7,
+                                                              alpha: 0.45,
                                                             ),
                                                       ),
                                                     ),
-                                                  ),
-                                                  Expanded(
-                                                    child: Divider(
-                                                      color: Colors.white
-                                                          .withValues(
-                                                            alpha: 0.45,
+                                                    Padding(
+                                                      padding:
+                                                          const EdgeInsets.symmetric(
+                                                            horizontal: 8,
                                                           ),
-                                                    ),
-                                                  ),
-                                                ],
-                                              ),
-                                            ),
-                                          );
-                                        }
-                                        // ValueKey(id)：归档移位后 Element 不复用，
-                                        // AnimatedContainer 不跨条目做颜色/圆角插值
-                                        return Column(
-                                          key: ValueKey(id),
-                                          mainAxisSize: MainAxisSize.min,
-                                          children: [
-                                            // null-aware element：分隔线为 null（非
-                                            // 首条归档）时跳过不渲染
-                                            ?archivedSeparator,
-                                            // 归档/恢复 = 朝屏幕内侧划走
-                                            //（停靠右缘左滑 / 左缘右滑，
-                                            // 镜像方向由 dismissDirection
-                                            // 驱动）；反方向（朝停靠边缘）
-                                            // 快滑转发收起：手势与主 App
-                                            // diary_tab 同源（同一组件
-                                            // SwipeDismissCard）——拖跟手
-                                            // 滑动，过阈值或快甩触发划走，
-                                            // 但不要日记页的「转圈+图标」
-                                            // 揭示效果（showIcon: false，
-                                            // 用户定夺）。fullWidth=false
-                                            // 贴合自适应卡宽（不拉宽胶囊
-                                            // 造型）；时长曲线对齐悬浮窗
-                                            // 节奏——弹回=卡片级
-                                            // animationDuration(200ms)
-                                            // +easeOutCubic，划出=
-                                            // panelSlideDuration(240ms)
-                                            // +easeInCubic（与面板收起滑出
-                                            // 同款加速推出感）
-                                            SwipeDismissCard(
-                                              fullWidth: false,
-                                              showIcon: false,
-                                              dismissDirection: _sideLeft
-                                                  ? SwipeDismissDirection.right
-                                                  : SwipeDismissDirection.left,
-                                              springDuration: OverlayConstants
-                                                  .animationDuration,
-                                              springCurve: Curves.easeOutCubic,
-                                              dismissDuration: OverlayConstants
-                                                  .panelSlideDuration,
-                                              dismissCurve: Curves.easeInCubic,
-                                              onSwipeCollapseThreshold:
-                                                  OverlayConstants
-                                                      .edgeSwipeThreshold,
-                                              // 卡片上朝停靠边缘快滑转发收起：
-                                              // 卡片内水平拖拽在手势竞技场赢过
-                                              // 面板层收起手势，不转发则
-                                              // 「卡片上朝停靠边缘快滑收起」失效
-                                              onSwipeCollapse: _collapse,
-                                              // 编辑态降级：不注册手势，滑动落回
-                                              // 面板层只收键盘（与面板右滑同规则）
-                                              enabled: _editingDiaryId == null,
-                                              onDismissed: () =>
-                                                  _onCardSwipeDismissed(diary),
-                                              child: OverlayDiaryCard(
-                                                diary: diary,
-                                                // 锁定且会话外：卡片内部打码
-                                                //（收起态/展开态正文均不出现明文）
-                                                lockedHidden:
-                                                    _isLockedHidden(diary),
-                                                // 卡片宽度上限：仅本卡展开时用加宽值，
-                                                // 收起卡恒用默认值（面板加宽不影响其他卡）
-                                                maxWidth:
-                                                    _expandedIds.contains(id)
-                                                    ? expandedCardMaxWidth
-                                                    : collapsedCardMaxWidth,
-                                                // 停靠侧透传：胶囊贴停靠侧对齐 +
-                                                // 展开↔收起过渡锚点/收卷窗口同侧
-                                                dockLeft: _sideLeft,
-                                                // 展开态真值按 id 查（归档移位不错位）
-                                                expanded: _expandedIds.contains(
-                                                  id,
-                                                ),
-                                                // 单击卡片 = 展开全文；展开态整卡 onTap
-                                                // 置空不再收起（防与底部按钮区误触），
-                                                // 展开态唯一收起入口 = 卡片右上角 chevron
-                                                //（onCollapse，见下）
-                                                onTap: _expandedIds.contains(id)
-                                                    ? null
-                                                    : () => _toggleExpand(id),
-                                                // 复选框 = 归档/恢复 toggle（点复选框不冒泡展开）
-                                                onCheckChanged: (target) =>
-                                                    _toggleArchive(
-                                                      diary,
-                                                      target,
-                                                    ),
-                                                // 播放按钮：本卡播放中图标切 pause。
-                                                // 渲染与否由卡片按 audio_path + 归档态自判
-                                                isPlayingAudio:
-                                                    _playingDiaryId == id &&
-                                                    _isPlaying,
-                                                // 点按钮 → 播放/暂停/切卡（_toggleAudioPlay 三分支）
-                                                onPlayToggle: () =>
-                                                    _toggleAudioPlay(diary),
-                                                // 展开态右上角收起 chevron：编辑态
-                                                // 点击 = 取消编辑（等同 ✗），非编辑态
-                                                // = 收起卡片
-                                                onCollapse:
-                                                    _editingDiaryId == id
-                                                    ? _cancelEdit
-                                                    : () => _toggleExpand(id),
-                                                // 正文编辑态：本卡为编辑卡时正文换
-                                                // TextField、底条变「✗取消 / ✓保存」
-                                                editing: _editingDiaryId == id,
-                                                editController:
-                                                    _editingDiaryId == id
-                                                    ? _editController
-                                                    : null,
-                                                editFocusNode:
-                                                    _editingDiaryId == id
-                                                    ? _editFocusNode
-                                                    : null,
-                                                // 查看态正文点击进入编辑（参数 = 字符
-                                                // 偏移）；content 为空的转写占位行不
-                                                // 传 onTextTap（不可编辑）
-                                                onTextTap:
-                                                    ((diary['content']
-                                                                as String?) ??
-                                                            '')
-                                                        .isEmpty
-                                                    ? null
-                                                    : (offset) => _enterEdit(
-                                                        diary,
-                                                        offset,
+                                                      child: Text(
+                                                        '已归档',
+                                                        style: TextStyle(
+                                                          fontSize: _fs(12),
+                                                          color: Colors.white
+                                                              .withValues(
+                                                                alpha: 0.7,
+                                                              ),
+                                                        ),
                                                       ),
-                                                onEditSave: _saveEdit,
-                                                onEditCancel: _cancelEdit,
-                                                // 删除二次确认态（底行变「确认删除？✓✗」）
-                                                isDeleteConfirming:
-                                                    _deleteConfirmIds.contains(
-                                                      id,
                                                     ),
-                                                // 底部按钮条：删除（两次点击流转）/ ✗ 取消 /
-                                                // 复制 / AI 对话（原生复制 + 拉起设置页
-                                                // 选择的 AI 应用，见 _onCardShareToAI；
-                                                // 原系统分享面板入口已被 AI 对话替换）
-                                                onDelete: () =>
-                                                    _onCardDelete(diary),
-                                                onDeleteCancel: () =>
-                                                    _onCardDeleteCancel(id),
-                                                onCopy: () => _onCardCopy(
-                                                  diary,
+                                                    Expanded(
+                                                      child: Divider(
+                                                        color: Colors.white
+                                                            .withValues(
+                                                              alpha: 0.45,
+                                                            ),
+                                                      ),
+                                                    ),
+                                                  ],
                                                 ),
-                                                // 闹钟：识别时间预填转轮确认 sheet →
-                                                // 写系统日历（见 _onCardAlarm）
-                                                onAlarm: () =>
-                                                    _onCardAlarm(diary),
-                                                onAiChat: () =>
-                                                    _onCardShareToAI(
+                                              ),
+                                            );
+                                          }
+                                          // ValueKey(id)：归档移位后 Element 不复用，
+                                          // AnimatedContainer 不跨条目做颜色/圆角插值
+                                          final Widget item = Column(
+                                            key: ValueKey(id),
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              // null-aware element：分隔线为 null（非
+                                              // 首条归档）时跳过不渲染
+                                              ?archivedSeparator,
+                                              // 归档/恢复 = 朝屏幕内侧划走
+                                              //（停靠右缘左滑 / 左缘右滑，
+                                              // 镜像方向由 dismissDirection
+                                              // 驱动）；反方向（朝停靠边缘）
+                                              // 快滑转发收起：手势与主 App
+                                              // diary_tab 同源（同一组件
+                                              // SwipeDismissCard）——拖跟手
+                                              // 滑动，过阈值或快甩触发划走，
+                                              // 但不要日记页的「转圈+图标」
+                                              // 揭示效果（showIcon: false，
+                                              // 用户定夺）。fullWidth=false
+                                              // 贴合自适应卡宽（不拉宽胶囊
+                                              // 造型）；时长曲线对齐悬浮窗
+                                              // 节奏——弹回=卡片级
+                                              // animationDuration(200ms)
+                                              // +easeOutCubic，划出=
+                                              // panelSlideDuration(240ms)
+                                              // +easeInCubic（与面板收起滑出
+                                              // 同款加速推出感）
+                                              SwipeDismissCard(
+                                                fullWidth: false,
+                                                showIcon: false,
+                                                dismissDirection: _sideLeft
+                                                    ? SwipeDismissDirection
+                                                          .right
+                                                    : SwipeDismissDirection
+                                                          .left,
+                                                springDuration: OverlayConstants
+                                                    .animationDuration,
+                                                springCurve:
+                                                    Curves.easeOutCubic,
+                                                dismissDuration:
+                                                    OverlayConstants
+                                                        .panelSlideDuration,
+                                                dismissCurve:
+                                                    Curves.easeInCubic,
+                                                onSwipeCollapseThreshold:
+                                                    OverlayConstants
+                                                        .edgeSwipeThreshold,
+                                                // 卡片上朝停靠边缘快滑转发收起：
+                                                // 卡片内水平拖拽在手势竞技场赢过
+                                                // 面板层收起手势，不转发则
+                                                // 「卡片上朝停靠边缘快滑收起」失效
+                                                onSwipeCollapse: () =>
+                                                    _collapse(source: '卡片快滑'),
+                                                // 编辑态降级：不注册手势，滑动落回
+                                                // 面板层只收键盘（与面板右滑同规则）
+                                                enabled:
+                                                    _editingDiaryId == null,
+                                                onDismissed: () =>
+                                                    _onCardSwipeDismissed(
                                                       diary,
                                                     ),
-                                                // 锁定开关（底条锁图标）：锁定 =
-                                                // 结束解锁会话整体打码；解除锁定
-                                                // 会话外先认证（语义与主 App 一致）
-                                                onLockToggle: () =>
-                                                    _toggleDiaryLock(diary),
-                                                // 标注三色按钮（展开卡时间行
-                                                // 一级直出）：点 tag 写库换色
-                                                //（点已选中的 tag = 取消标注，
-                                                // 传 null）。归档卡同样允许标注
-                                                //（视觉仍灰，恢复后显示标注色）
-                                                onTagToggle: (tag) =>
-                                                    _setDiaryTag(id, tag),
+                                                child: OverlayDiaryCard(
+                                                  diary: diary,
+                                                  // 字体大小档位透传（卡片全部
+                                                  // 文字随档位 ±1pt 缩放）
+                                                  fontSizeStep: _fontSizeStep,
+                                                  // 锁定且会话外：卡片内部打码
+                                                  //（收起态/展开态正文均不出现明文）
+                                                  lockedHidden: _isLockedHidden(
+                                                    diary,
+                                                  ),
+                                                  // 卡片宽度上限：仅本卡展开时用加宽值，
+                                                  // 收起卡恒用默认值（面板加宽不影响其他卡）
+                                                  maxWidth:
+                                                      _expandedIds.contains(id)
+                                                      ? expandedCardMaxWidth
+                                                      : collapsedCardMaxWidth,
+                                                  // 停靠侧透传：胶囊贴停靠侧对齐 +
+                                                  // 展开↔收起过渡锚点/收卷窗口同侧
+                                                  dockLeft: _sideLeft,
+                                                  // 展开态真值按 id 查（归档移位不错位）
+                                                  expanded: _expandedIds
+                                                      .contains(id),
+                                                  // 单击卡片 = 展开全文；展开态整卡 onTap
+                                                  // 置空不再收起（防与底部按钮区误触），
+                                                  // 展开态唯一收起入口 = 卡片右上角 chevron
+                                                  //（onCollapse，见下）
+                                                  onTap:
+                                                      _expandedIds.contains(id)
+                                                      ? null
+                                                      : () => _toggleExpand(id),
+                                                  // 复选框 = 归档/恢复 toggle（点复选框不冒泡展开）
+                                                  onCheckChanged: (target) =>
+                                                      _toggleArchive(
+                                                        diary,
+                                                        target,
+                                                      ),
+                                                  // 播放按钮：本卡播放中图标切 pause。
+                                                  // 渲染与否由卡片按 audio_path + 归档态自判
+                                                  isPlayingAudio:
+                                                      _playingDiaryId == id &&
+                                                      _isPlaying,
+                                                  // 点按钮 → 播放/暂停/切卡（_toggleAudioPlay 三分支）
+                                                  onPlayToggle: () =>
+                                                      _toggleAudioPlay(diary),
+                                                  // 展开态右上角收起 chevron：编辑态
+                                                  // 点击 = 取消编辑（等同 ✗），非编辑态
+                                                  // = 收起卡片
+                                                  onCollapse:
+                                                      _editingDiaryId == id
+                                                      ? _cancelEdit
+                                                      : () => _toggleExpand(id),
+                                                  // 正文编辑态：本卡为编辑卡时正文换
+                                                  // TextField、底条变「✗取消 / ✓保存」
+                                                  editing:
+                                                      _editingDiaryId == id,
+                                                  editController:
+                                                      _editingDiaryId == id
+                                                      ? _editController
+                                                      : null,
+                                                  editFocusNode:
+                                                      _editingDiaryId == id
+                                                      ? _editFocusNode
+                                                      : null,
+                                                  // 查看态正文点击进入编辑（参数 = 字符
+                                                  // 偏移）；content 为空的转写占位行不
+                                                  // 传 onTextTap（不可编辑）
+                                                  onTextTap:
+                                                      ((diary['content']
+                                                                  as String?) ??
+                                                              '')
+                                                          .isEmpty
+                                                      ? null
+                                                      : (offset) => _enterEdit(
+                                                          diary,
+                                                          offset,
+                                                        ),
+                                                  // 查看态正文长按 = 大爆炸分词层
+                                                  //（词块点选/滑选复制）；空内容
+                                                  // 占位行与锁定打码卡不传——明文
+                                                  // 不得出卡片（同 AI 对话/复制的
+                                                  // 锁定门禁语义）
+                                                  onLongPressText:
+                                                      ((diary['content']
+                                                                      as String?) ??
+                                                                  '')
+                                                              .isEmpty ||
+                                                          _isLockedHidden(
+                                                            diary,
+                                                          )
+                                                      ? null
+                                                      : () => _openBigBang(
+                                                          (diary['content']
+                                                                  as String?) ??
+                                                              '',
+                                                        ),
+                                                  onEditSave: _saveEdit,
+                                                  onEditCancel: _cancelEdit,
+                                                  // 删除二次确认态（底行变「确认删除？✓✗」）
+                                                  isDeleteConfirming:
+                                                      _deleteConfirmIds
+                                                          .contains(id),
+                                                  // 底部按钮条：删除（两次点击流转）/ ✗ 取消 /
+                                                  // 复制 / AI 对话（原生复制 + 拉起设置页
+                                                  // 选择的 AI 应用，见 _onCardShareToAI；
+                                                  // 原系统分享面板入口已被 AI 对话替换）
+                                                  onDelete: () =>
+                                                      _onCardDelete(diary),
+                                                  onDeleteCancel: () =>
+                                                      _onCardDeleteCancel(id),
+                                                  onCopy: () =>
+                                                      _onCardCopy(diary),
+                                                  // 闹钟：识别时间预填转轮确认 sheet →
+                                                  // 写系统日历（见 _onCardAlarm）
+                                                  onAlarm: () =>
+                                                      _onCardAlarm(diary),
+                                                  onAiChat: () =>
+                                                      _onCardShareToAI(diary),
+                                                  // 锁定开关（底条锁图标）：锁定 =
+                                                  // 结束解锁会话整体打码；解除锁定
+                                                  // 会话外先认证（语义与主 App 一致）
+                                                  onLockToggle: () =>
+                                                      _toggleDiaryLock(diary),
+                                                  // 标注三色按钮（展开卡时间行
+                                                  // 一级直出）：点 tag 写库换色
+                                                  //（点已选中的 tag = 取消标注，
+                                                  // 传 null）。归档卡同样允许标注
+                                                  //（视觉仍灰，恢复后显示标注色）
+                                                  onTagToggle: (tag) =>
+                                                      _setDiaryTag(id, tag),
+                                                ),
                                               ),
-                                            ),
-                                          ],
-                                        );
-                                      },
+                                            ],
+                                          );
+                                          // 长按拖动排序（仅活跃卡收起态）：活跃+未展开+
+                                          // 非编辑中的卡片包 ReorderableDelayedDragStartListener
+                                          //（key 必须落在 ReorderableListView 直接 child 上）；
+                                          // 展开/归档/编辑中的卡片不包 → 长按落回
+                                          // onTap 展开 / 滑走归档的既有手势，互不冲突
+                                          if (isArchived ||
+                                              _expandedIds.contains(id) ||
+                                              _editingDiaryId != null) {
+                                            return item;
+                                          }
+                                          return ReorderableDelayedDragStartListener(
+                                            key: ValueKey(id),
+                                            index: index,
+                                            child: item,
+                                          );
+                                        },
+                                      ),
                                     ),
-                                  ),
-                          ),
-                        ],
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                   ),
-                ),
-                builder: (context, panelChild) => FractionalTranslation(
-                  // (1-t)×child宽：t=0 整块推出停靠缘侧的窗口边界，被 surface
-                  // 裁剪=滑出屏幕（停靠左缘取负号镜像）
-                  translation: Offset(
-                    (1 - _panelAnimCurve.value) * (_sideLeft ? -1 : 1),
-                    0,
-                  ),
-                  child: Opacity(
-                    opacity: _panelAnimCurve.value,
-                    child: panelChild,
+                  builder: (context, panelChild) => FractionalTranslation(
+                    // (1-t)×child宽：t=0 整块推出停靠缘侧的窗口边界，被 surface
+                    // 裁剪=滑出屏幕（停靠左缘取负号镜像）
+                    translation: Offset(
+                      (1 - _panelAnimCurve.value) * (_sideLeft ? -1 : 1),
+                      0,
+                    ),
+                    child: Opacity(
+                      opacity: _panelAnimCurve.value,
+                      child: panelChild,
+                    ),
                   ),
                 ),
               ),
@@ -2536,6 +3090,30 @@ class _OverlayHomeState extends State<OverlayHome>
                   ),
                 ),
               ),
+            // 大爆炸分词层（展开卡正文长按）：压在最上层盖住面板与空白区——
+            // 窗口本就是全屏，无需 resize；层顶边对齐面板 header 上缘（新增
+            // 按钮所在工具条：状态栏固定避让 + 面板高度档下压偏移），随
+            // 「面板高度」档位联动下移进拇指区；关闭/复制成功置 null 即撤
+            if (_bigBangText != null)
+              Positioned.fill(
+                child: BigBangLayer(
+                  text: _bigBangText!,
+                  fontSizeStep: _fontSizeStep,
+                  topInset:
+                      OverlayConstants.panelHeaderTopPadding +
+                      OverlayConstants.panelTopOffsetFor(_panelMaxCards),
+                  onClose: () => setState(() => _bigBangText = null),
+                  onCopy: AccessibilityOverlay.copyText,
+                  // 联网搜索选中词块：读搜索配置后经原生 openUrl 拉起浏览器
+                  onSearch: (text) async {
+                    final cfg = await loadSearchConfig();
+                    return AccessibilityOverlay.openUrl(
+                      url: buildSearchUrl(cfg.engine, text),
+                      packageName: cfg.browserPackage,
+                    );
+                  },
+                ),
+              ),
           ],
         );
       },
@@ -2553,7 +3131,7 @@ class _OverlayHomeState extends State<OverlayHome>
       onTap: () {
         // 编辑态手势降级：空白区点击只收起键盘，不收起面板、不退出编辑
         if (_dismissKeyboardIfEditing()) return;
-        _collapse();
+        _collapse(source: '空白区点击');
       },
       onHorizontalDragUpdate: (details) {
         // 编辑态手势降级：滑动只收起键盘，不标记待收起
@@ -2569,7 +3147,7 @@ class _OverlayHomeState extends State<OverlayHome>
         if (_dismissKeyboardIfEditing()) return;
         if (_willCollapse) {
           _willCollapse = false;
-          _collapse();
+          _collapse(source: '空白区滑动');
         }
       },
       // drag 被取消时清掉残留标记（堵既有边角：标记残留会污染下一次手势）
@@ -2584,10 +3162,11 @@ class _OverlayHomeState extends State<OverlayHome>
     final allIds = _diaries.map((d) => d['id'] as int).toSet();
     return Padding(
       // 全屏窗口（FLAG_LAYOUT_NO_LIMITS）延伸到状态栏下，overlay 窗口拿不到
-      // 系统 insets，用固定 padding 避让状态栏（16 侧 = 停靠缘侧，随侧镜像）
+      // 系统 insets，用固定 padding 避让状态栏（16 侧 = 停靠缘侧，随侧镜像；
+      // 顶部值与大爆炸层顶边同源，见 OverlayConstants.panelHeaderTopPadding）
       padding: EdgeInsets.fromLTRB(
         _sideLeft ? 8 : 16,
-        40,
+        OverlayConstants.panelHeaderTopPadding,
         _sideLeft ? 16 : 8,
         4,
       ),
@@ -2598,7 +3177,7 @@ class _OverlayHomeState extends State<OverlayHome>
         onNewNote: _startNewNote,
         onToggleExpandAll: _toggleExpandAll,
         onOpenDiaryPage: _openDiaryPage,
-        onCollapse: _collapse,
+        onCollapse: () => _collapse(source: '收起按钮'),
       ),
     );
   }
@@ -2611,7 +3190,7 @@ class _OverlayHomeState extends State<OverlayHome>
         child: Text(
           '暂无随手记',
           textAlign: TextAlign.center,
-          style: TextStyle(fontSize: 14, color: ext.textHint),
+          style: TextStyle(fontSize: _fs(14), color: ext.textHint),
         ),
       ),
     );
@@ -2627,10 +3206,21 @@ class _OverlayHomeState extends State<OverlayHome>
           child: Text(
             '⚠️ 加载失败 · 点击重试',
             textAlign: TextAlign.center,
-            style: TextStyle(fontSize: 14, color: ext.textHint),
+            style: TextStyle(fontSize: _fs(14), color: ext.textHint),
           ),
         ),
       ),
     );
   }
+}
+
+/// 滑动删除的待撤销槽位内容（OverlayHome._pendingSwipeDelete 的元素类型）：
+/// 删除前的完整行快照（撤销时全字段原样插回，sync_uuid 保留）+ 撤销
+/// 窗口计时器（到期/被打断即落定 = 补删录音文件）。录音文件在窗口内
+/// 保留在盘上，撤销才能连音频一起还原
+class _PendingSwipeDelete {
+  final Map<String, dynamic> row;
+  final Timer timer;
+
+  _PendingSwipeDelete({required this.row, required this.timer});
 }

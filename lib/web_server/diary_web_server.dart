@@ -52,9 +52,9 @@ abstract class DiaryNoteRepository {
   /// 删除，返回受影响行数（0 = id 不存在）
   Future<int> deleteById(int id);
 
-  /// 廉价变更签名：一次聚合查询（count / maxId / 内容总长 / 归档数）。
-  /// 手机端（主 engine 或悬浮窗 engine）任何增删改都会让签名变化，
-  /// 服务每秒比对一次，变了就 SSE 推浏览器刷新
+  /// 廉价变更签名：一次聚合查询（count / maxId / 内容总长 / 归档数 /
+  /// 排序加权和）。手机端（主 engine 或悬浮窗 engine）任何增删改（含
+  /// 拖动排序）都会让签名变化，服务每秒比对一次，变了就 SSE 推浏览器刷新
   Future<String> changeSignature();
 }
 
@@ -81,13 +81,17 @@ class DbDiaryNoteRepository implements DiaryNoteRepository {
   @override
   Future<String> changeSignature() async {
     final dbClient = await _dbHelper.db;
+    // SUM(sort_order * id)：重排后 SUM(sort_order) 不变（0..n-1 恒为
+    // n(n-1)/2），加权和才随顺序变化——拖动排序也能被签名捕获推浏览器；
+    // 归档行 sort_order 恒 NULL 被 SUM 忽略，不影响
     final rows = await dbClient.rawQuery(
       'SELECT COUNT(*) AS c, COALESCE(MAX(id), 0) AS m, '
       'COALESCE(SUM(LENGTH(content)), 0) AS s, '
-      'COALESCE(SUM(is_archived), 0) AS a FROM diary',
+      'COALESCE(SUM(is_archived), 0) AS a, '
+      'COALESCE(SUM(sort_order * id), 0) AS o FROM diary',
     );
     final r = rows.first;
-    return 'c=${r['c']},m=${r['m']},s=${r['s']},a=${r['a']}';
+    return 'c=${r['c']},m=${r['m']},s=${r['s']},a=${r['a']},o=${r['o']}';
   }
 }
 

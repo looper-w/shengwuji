@@ -65,7 +65,10 @@ getPhonemeInfo(text)                        → 输入音素序列（带字符�
         ├ 行最小值早停剪枝（CapsWriter 同款，+2 放宽）
         └ 同终点只留最优
   └ 分类：score ≥ threshold 且音素数 ≥4 → 强制替换候选
-          score ≥ similarThreshold        → similars（UI 提示）
+          score ≥ similarThreshold 且原文 != 热词 → similars（UI 提示；
+          原样命中即原文逐字==热词不提示——替换通道对它原地不替换，
+          提示也是废话；⚠️ 不能用 score<1.0 过滤，100% 只是发音一致，
+          同音错字恰恰要提示）
   └ 冲突解决：分数优先 > 覆盖长度优先，区间不重叠，原文==目标只占位，
     从后往前写回
 ```
@@ -132,3 +135,7 @@ target+alias（跨格式解析判定）时不重复添加。必须用主实例�
   直接 return），5 处提示（diary/record 相似替换、diary/record 修正对、
   热词升级提议）显式 `persist: false` 才按 duration 隐藏（相似提示 3s、
   修正对/升级提议 6s）。
+- 2026-09-25：原样命中不进提示。识别文本已逐字等于热词（模型没识别错，
+  热词原地 100% 命中）时替换通道「原地不替换」、提示通道却仍弹
+  「客厅→客厅 100%」——similars 收集补 `original != target` 过滤（与替换
+  通道守卫对齐；不能用 score<1.0 过滤，同音错字 100% 恰恰要提示）。

@@ -165,6 +165,43 @@ worker 单线程逐条处理消息，天然 FIFO：搬家模式 VAD 连发多段
 - [lib/recognition_service.dart](../../lib/recognition_service.dart) - 常驻识别 worker 服务（消息协议 / 请求关联 / 超时 / 崩溃重启 / 风暴防护）
 - [lib/recognizer_singleton.dart](../../lib/recognizer_singleton.dart) - 门面（路径解析 + `isServingLatestModel` 热切换守卫）
 
+## 主 App 引擎生命周期：退后台延迟释放 + 并行预热（2026-09-25 起）
+
+主 App、悬浮窗、输入法 Provider 是同进程的三个独立 FlutterEngine，模型各自加载、内存不共享。悬浮窗（120s idle 释放，`overlay_voice_memo.dart`）与输入法（90s idle 释放）早有闲置释放，主 App 此前**加载后永不释放**——对"悬浮窗 + 输入法为主"的用户，主 App 那份 int8 模型（约 229MB + 运行时开销）常驻是纯浪费。本轮把主 App 改为「退后台 8s 延迟释放 + 回前台并行预热」，预期稳态任意时刻通常只有一份模型在内存。
+
+### 退后台延迟释放（main.dart `_MainScaffoldState`）
+
+- `paused/hidden` → 排 8s 延迟 Timer（`inactive` 是过渡态——通知栏下拉/权限弹窗也触发——不作条件）；`resumed` → 取消 Timer 并复位顺延计数。
+- Timer 到点守卫（`_backgroundReleaseGuard`）：仍在后台 && `RecognitionActivity.inFlight == false` && `RecognizerSingleton.instance.isReady` → 打 `[BackgroundRelease]` 日志后 `dispose()`。
+- 在途识别 > 0 时顺延：10s 后再查一轮，上限 3 轮（超长转写约 30s 后放弃本轮，待下次退后台重计——防死循环）。
+- 释放后**不主动加载**：回前台的首次录音由各入口的并行预热兜住（下节）。
+
+### 在途识别计数器（lib/utils/recognition_activity.dart）
+
+全局 static 计数，`begin()/end()` 必须配对且 end 放 finally（transcribe 抛错也回退，防计数泄漏导致引擎永不释放）。计数点（5 对）：record_tab `_stopListening`（守卫加载 + 转写整段）、record_tab `_recognizeAndSave`（搬家模式单段）、diary_tab `_processRecognition` 与 `_retranscribeDiary`（**整场一对**——VAD 长录音逐段计数会在段间隙归零，恰好撞上释放轮询会丢段）、list_tab `_processVoiceSearch`。
+
+### 并行预热（照抄悬浮窗 overlay_voice_memo.start）
+
+各录音入口「开录不等模型」：开录后 `preloadModelPath()` + `unawaited(initialize())`（冷加载 1~1.5s 被说话时间盖住），转写前统一 `await initialize()` 兜底（门面 `_isInitializing` 归并，不会 double spawn）。入口与兜底：
+
+| 入口 | 预热点 | 转写兜底 |
+| --- | --- | --- |
+| record_tab 普通录音 | `_startListening` 尾部（本就开录不等模型） | `_stopListening` 守卫 |
+| record_tab 搬家模式 | `_enterMoveMode`（"正在初始化..."状态条保留兜底） | `_recognizeAndSave` 未就绪先 initialize |
+| diary_tab 录音 | `startListening` 尾部 | `stopListening` 阶段4 守卫 |
+| diary_tab `refreshEngine` | hasEverInitialized 分支改 `unawaited(initEngine())`（快速录音链不再阻塞开录） | 同上 |
+| list_tab 语音查询 | 不强改（无说话时间可蹭，`startVoiceSearch` 未就绪才 await，保留 loading 提示） | `_processVoiceSearch` 未就绪提示重试 |
+| diary_tab 再次转写 | 无录音时间可蹭，保持阻塞 | `_retranscribeDiary` 既有守卫（initEngine 内 isServingLatestModel 放行） |
+
+### 释放后守卫语义（⚠️ 防再犯）
+
+`RecognizerSingleton.dispose()` 销毁 worker 并重建 `_service`、把 `_currentModelPath` 置 null，但 `hasEverInitialized` **不回退**。因此：
+
+1. **所有"未就绪才加载"守卫不能以 hasEverInitialized 短路**——record_tab `_stopListening` 旧双层守卫在该场景会跳过加载直接 transcribe 抛 StateError，diary_tab 阶段4 旧 else 分支无失败处理会掉进 `_engineReadyCompleter.future` 永久挂起，均已改为统一"未就绪就 initEngine + 失败处理"。
+2. 重新加载前必须 `preloadModelPath()`（预热处显式调用；兜底处由 `initialize()` 内部 `_currentModelPath == null` 自动补）。
+3. `diary_tab.refreshEngine` 的 hasEverInitialized 分支判 `!isReady || !isServingLatestModel` 两者其一即触发后台预热——只判 isReady 会把模型热切换（旧模型活着 isReady=true 但服务旧路径）短路掉。
+4. 各 tab 本地 `isReady` 状态与门面状态可能短暂不一致（释放后本地仍 true），一律以 `_recognizerManager.isReady` 为准做转写前守卫。
+
 ## 录音触发方式
 
 应用支持三种录音触发方式：

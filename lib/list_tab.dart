@@ -13,6 +13,7 @@ import '../recognizer_singleton.dart';
 import '../text_processor.dart';
 import '../theme/app_theme_extension.dart';
 import '../utils/query_detector.dart';
+import '../utils/recognition_activity.dart';
 import 'widgets/neu_widgets.dart';
 
 class ListTab extends StatefulWidget {
@@ -321,9 +322,17 @@ class ListTabState extends State<ListTab> {
       }
 
       // 识别（同步 FFI decode 在 worker isolate 内执行，不阻塞主 isolate UI）
-      final rawText = await _recognizerManager.transcribe(
-        Float32List.fromList(_audioBuffer),
-      );
+      // 在途识别计数：防退后台释放守卫在 decode 中途 dispose worker
+      //（begin/end 局部配对，抛错也回退）
+      RecognitionActivity.begin();
+      final String rawText;
+      try {
+        rawText = await _recognizerManager.transcribe(
+          Float32List.fromList(_audioBuffer),
+        );
+      } finally {
+        RecognitionActivity.end();
+      }
       log("🔍 [ListTab] 原始识别: $rawText");
 
       if (rawText.isEmpty) {

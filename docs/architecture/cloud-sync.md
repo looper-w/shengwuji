@@ -24,7 +24,7 @@ P1 边界（用户拍板）：
 ```
 /shengwuji_sync/
 ├── manifest.json          # 软锁 + 版本 + 最后同步者 + 各类条数（诊断用）
-├── diary.json             # 日记数组（uuid/content/created_at/audio 文件名/时长/归档/标注）
+├── diary.json             # 日记数组（uuid/content/created_at/audio 文件名/时长/归档/标注/排序键 sort_order）
 ├── items.json             # 物品数组（uuid/name/location）
 ├── hotwords.txt           # 原样热词文本（与本地 user_hotwords.txt 同格式）
 ├── correction_pairs.json  # 修正对数组（error/correct/hit_count/created_at/last_used_at）
@@ -89,6 +89,12 @@ If-Match），软锁只防常规误并发，极端同时点击下可能双开—
 | 数据 | 合并键 | 规则 | 实现位置 |
 |------|--------|------|----------|
 | 日记 | sync_uuid；自然键 content+created_at 辅助去重 | 缺失才插入 | `planDiaryInserts` |
+
+> 日记的 sort_order（v16 排序键）随 diary.json 上云，但 P1 合并仍只做
+> 新增并集——下载插入时：**本地活跃区为空**尊重远端 sort_order 原值
+> （整区搬过来顺序不变）；**非空**则新行按 created_at DESC 逐个 min-1
+> 堆到活跃区顶部（远端行相对时间顺序保持，本地已有自定义顺序不被搅乱）。
+> 两端各自重排过的顺序不互相覆盖（与「编辑不跨端」同一边界）。
 | 物品 | sync_uuid；自然键 name+location | 同上 | `planItemInserts` |
 | 热词 | 行级并集；字面对（错词=正词）同错词保留本地 | 本地意图优先 | `mergeHotwordContent` |
 | 修正对 | (error_text, corrected_text) | hit_count 取大、last_used_at 取新 | `DbHelper.mergeRemoteCorrectionPairs` |
@@ -189,3 +195,7 @@ P1 无自动同步，卡片若只显示上次同步结果快照，用户同步�
   下次续传；录音阶段失败不拖垮文本同步；下载按 sync_uuid 回填
   audio_path（不 bump 数据版本）、墓碑行不拉回；文件名过 isSafeAudioName
   安全校验。合并计划纯函数 planAudioUploads/planAudioDownloads 单测覆盖。
+- 2026-09-29：diary.json 携带 sort_order（v16 悬浮窗长按拖动排序键，
+  编解码宽容——旧云端文件无此字段按 null 处理）。下载插入排序决策：
+  本地活跃区空尊重远端值、非空堆顶部；两端各自重排的顺序不互相覆盖
+  （P1「编辑不跨端」边界的延伸）。

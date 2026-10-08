@@ -44,6 +44,13 @@ class DbHelper {
       } catch (e) {
         log("[DbHelper] ⚠️ sync 表结构自愈失败（写入将不可用，重启重试）：$e");
       }
+      // v16 自愈：同 _ensureSyncSchema 同款理由（版本号被中断的升级污染时
+      // 以实际表结构为准），diary 缺 sort_order 列就地补齐
+      try {
+        await _ensureSortOrderSchema(dbClient);
+      } catch (e) {
+        log("[DbHelper] ⚠️ sort_order 表结构自愈失败（排序将退回纯时间序，重启重试）：$e");
+      }
       // sync_uuid 回填在连接建立后做（幂等）：onCreate/onUpgrade 事务里只做
       // DDL，把逐行生成 UUID 的 Dart 循环挪出升级事务——升级窗口缩到毫秒级，
       // 回填失败也不阻塞使用（同步前 ensureSyncUuids / 下次启动会重试）
@@ -54,6 +61,15 @@ class DbHelper {
         }
       } catch (e) {
         log("[DbHelper] sync_uuid 回填失败（下次启动/同步前重试）：$e");
+      }
+      // sort_order 回填同 sync_uuid 模式（幂等，挪出升级事务）
+      try {
+        final backfilled = await _backfillSortOrder(dbClient);
+        if (backfilled > 0) {
+          log("[DbHelper] 首开后回填 $backfilled 条活跃日记 sort_order");
+        }
+      } catch (e) {
+        log("[DbHelper] sort_order 回填失败（下次启动重试）：$e");
       }
       return dbClient;
     } catch (e) {
@@ -85,6 +101,52 @@ class DbHelper {
     );
   }
 
+  /// v16 表结构自愈（幂等，正常库一次 PRAGMA 零开销）：
+  /// 与 _ensureSyncSchema 同款理由——版本号不可信（被中断的升级可能留下
+  /// user_version=16 但 sort_order 列缺失的坏库），以实际表结构为准
+  Future<void> _ensureSortOrderSchema(Database dbClient) async {
+    final cols = await dbClient.rawQuery('PRAGMA table_info(diary)');
+    final hasSortOrder = cols.any((c) => c['name'] == 'sort_order');
+    if (!hasSortOrder) {
+      await dbClient.execute(
+        "ALTER TABLE diary ADD COLUMN sort_order INTEGER",
+      );
+      log("[DbHelper] 🔧 自愈：diary 缺 sort_order 列（版本号被中断的升级污染），已补列");
+    }
+  }
+
+  /// 活跃区 sort_order 回填（幂等，首开成功后执行——DDL 在迁移事务，
+  /// 逐行回填挪出升级事务，同 sync_uuid 回填模式）：
+  /// 活跃区 NULL 行赋 min-1 递减系列。⚠️ 迭代方向必须 created_at ASC：
+  /// 显示排序是 sort_order ASC（小=置顶），最旧行拿 min-1、最新行拿系列
+  /// 最小值，ASC 排出来才是「新在前」；按 DESC 迭代会把顺序整个颠倒。
+  /// 存量升级 = 全体 NULL → 赋负值系列，显示顺序与升级前完全一致
+  Future<int> _backfillSortOrder(Database dbClient) async {
+    final nullRows = await dbClient.query('diary',
+        columns: ['id'],
+        where: 'is_archived = 0 AND sort_order IS NULL',
+        orderBy: 'created_at ASC');
+    if (nullRows.isEmpty) return 0;
+    final minRow = await dbClient.rawQuery(
+        'SELECT MIN(sort_order) AS m FROM diary WHERE is_archived = 0');
+    var next = (minRow.first['m'] as int?) ?? 0;
+    final batch = dbClient.batch();
+    for (final r in nullRows) {
+      next -= 1;
+      batch.update('diary', {'sort_order': next},
+          where: 'id = ?', whereArgs: [r['id']]);
+    }
+    await batch.commit(noResult: true);
+    return nullRows.length;
+  }
+
+  /// 活跃区「置顶插入」的 sort_order 取值：当前最小值-1（空活跃区从 0 起）
+  Future<int> _nextTopSortOrder(Database dbClient) async {
+    final r = await dbClient.rawQuery(
+        'SELECT MIN(sort_order) AS m FROM diary WHERE is_archived = 0');
+    return ((r.first['m'] as int?) ?? 1) - 1;
+  }
+
   /// 打开重试：覆盖安装后第一次启动，旧进程被杀到 SQLite 文件锁彻底释放
   /// 有个短暂窗口，新进程立即 open 可能撞瞬态锁失败——首次打开失败的
   /// 连接对象后续使用全是 database_closed（真机 2026-09-21 复现，杀后台
@@ -104,10 +166,10 @@ class DbHelper {
   // 初始化数据库
   initDb() async {
     String path = join(await getDatabasesPath(), dbFileName);
-    // 版本升级：3->4 时长, 4->5 归档, 5->6 导出标记, 6->7 lists 表, 7->8 清单合并到日记, 8->9 dismissed_splits 表, 9->10 diary.tag 标注列, 10->11 correction_pairs 错误-修正表, 11->12 上下文纠错统计表, 12->13 修正对语境档案表, 13->14 云同步列（sync_uuid + 墓碑表）, 14->15 diary.is_locked 笔记锁定列
+    // 版本升级：3->4 时长, 4->5 归档, 5->6 导出标记, 6->7 lists 表, 7->8 清单合并到日记, 8->9 dismissed_splits 表, 9->10 diary.tag 标注列, 10->11 correction_pairs 错误-修正表, 11->12 上下文纠错统计表, 12->13 修正对语境档案表, 13->14 云同步列（sync_uuid + 墓碑表）, 14->15 diary.is_locked 笔记锁定列, 15->16 diary.sort_order 自定义排序列
     return await openDatabase(
       path,
-      version: 15,
+      version: 16,
       onCreate: (db, version) async {
         // 创建物品表：id, name (物品), location (位置)
         // sync_uuid：云同步全局唯一身份（本地自增 id 两台设备会撞，合并键必须用它）
@@ -116,9 +178,11 @@ class DbHelper {
         );
         // 创建日记表，包含音频时长字段；tag = 标注（悬浮窗标注功能，
         // 'urgent'/'star'/'idea'，NULL=无标注）；is_locked = 用户手动锁定的
-        // 笔记（防锁屏悬浮窗偷看：全链路打码 + 设备凭据认证后可看）
+        // 笔记（防锁屏悬浮窗偷看：全链路打码 + 设备凭据认证后可看）；
+        // sort_order = 活跃区自定义排序键（越小越靠前，仅活跃区有意义，
+        // 归档区行恒 NULL；悬浮窗长按拖动排序写入，主 App/电脑访问顺序跟随）
         await db.execute(
-          "CREATE TABLE diary(id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT, created_at TEXT, audio_path TEXT, duration INTEGER, is_archived INTEGER DEFAULT 0, exported_at TEXT, tag TEXT, sync_uuid TEXT, is_locked INTEGER DEFAULT 0)",
+          "CREATE TABLE diary(id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT, created_at TEXT, audio_path TEXT, duration INTEGER, is_archived INTEGER DEFAULT 0, exported_at TEXT, tag TEXT, sync_uuid TEXT, is_locked INTEGER DEFAULT 0, sort_order INTEGER)",
         );
         // dismissed_splits 表：用户在日记页 ✕ 掉的物品转存内容（V9 新增）
         // 同一 content UNIQUE，避免重复入库
@@ -322,6 +386,18 @@ class DbHelper {
             log("数据库迁移 v14→v15 失败（不阻止升级）：$e");
           }
         }
+        // 数据库升级：从版本15升级到版本16，diary 表新增 sort_order 排序列
+        //（活跃区自定义排序键，越小越靠前，仅活跃区有意义、归档区行恒 NULL；
+        // 存量活跃行为 NULL，由首开回填赋负值系列——显示顺序与升级前完全
+        // 一致，见 _backfillSortOrder）
+        if (oldVersion < 16) {
+          try {
+            await db.execute("ALTER TABLE diary ADD COLUMN sort_order INTEGER");
+            log("数据库迁移 v15→v16：diary 表已添加 sort_order 排序列（回填在首开后执行）");
+          } catch (e) {
+            log("数据库迁移 v15→v16 失败（不阻止升级）：$e");
+          }
+        }
       },
     );
   }
@@ -385,6 +461,38 @@ class DbHelper {
     return rows.map((r) => r['uuid'] as String).toSet();
   }
 
+  /// 撤销删除：把刚删除的日记行原样插回（本地自增 id 重新分配，其余字段
+  /// 全保留，含 sync_uuid——跨端身份不变，含 sort_order——撤销删除回到
+  /// 删除前的原位置而非顶部）并清除其同步墓碑（行已复活，
+  /// 墓碑残留会让云端同 uuid 条目永远无法再拉回本地）。
+  /// 调用方：悬浮窗「滑动直接删除」的撤销窗口（OverlayHome._undoSwipeDelete）。
+  /// 录音文件不在此处处理——撤销窗口内音频从未删除，无需还原
+  Future<int> restoreDeletedDiary(Map<String, dynamic> row) async {
+    final dbClient = await db;
+    final uuid = row['sync_uuid'] as String?;
+    final newId = await dbClient.insert('diary', {
+      'content': row['content'],
+      'created_at': row['created_at'],
+      'audio_path': row['audio_path'],
+      'duration': row['duration'],
+      'is_archived': row['is_archived'] ?? 0,
+      'exported_at': row['exported_at'],
+      'tag': row['tag'],
+      'sync_uuid': uuid,
+      'is_locked': row['is_locked'] ?? 0,
+      'sort_order': row['sort_order'],
+    });
+    if (uuid != null) {
+      await dbClient.delete(
+        'sync_deleted',
+        where: 'uuid = ?',
+        whereArgs: [uuid],
+      );
+    }
+    unawaited(CloudSyncDataVersion.bump()); // 库行删而又插，按变更计
+    return newId;
+  }
+
   // 内置说明卡片：首次创建数据库时调用，写入 8 条功能引导作为普通日记
   // 用户可左滑删除任意一条，删除后不会重生（除非清除数据/重装）
   // 时间戳策略：offsetSec 越大 → created_at 越新 → 排序越靠前
@@ -433,6 +541,9 @@ class DbHelper {
         'duration': 0,
         'is_archived': 0,
         'exported_at': null,
+        // sort_order 取 -offsetSec：越小越靠前，对齐 offsetSec 越大越靠前
+        // 的既有心智（与 created_at 排序等价，首次重排前的初始顺序）
+        'sort_order': -(t['offsetSec'] as int),
       });
     }
     await batch.commit(noResult: true);
@@ -500,6 +611,9 @@ class DbHelper {
       final createdAt = DateTime.now()
           .add(const Duration(seconds: 10))
           .toIso8601String();
+      // sort_order 从活跃区当前最小值-1 起递减：几条新卡按注册表顺序
+      // 依次置顶（对齐 created_at+10s 置顶的既有心智）
+      var nextOrder = await _nextTopSortOrder(dbClient);
       final batch = dbClient.batch();
       for (final content in newTutorials) {
         batch.insert('diary', {
@@ -509,6 +623,7 @@ class DbHelper {
           'duration': 0,
           'is_archived': 0,
           'exported_at': null,
+          'sort_order': nextOrder--,
         });
       }
       await batch.commit(noResult: true);
@@ -623,6 +738,10 @@ class DbHelper {
       'audio_path': audioPath,
       'duration': duration,
       'sync_uuid': const Uuid().v4(),
+      // 新卡置顶：取活跃区当前最小 sort_order - 1（统一入口，
+      // diary_tab/record_tab/overlay_data_client/overlay_voice_memo
+      // 全部调用方共享同一语义）
+      'sort_order': await _nextTopSortOrder(dbClient),
     };
     final id = await dbClient.insert('diary', map);
     unawaited(CloudSyncDataVersion.bump()); // 本地有变更未上云，入口行提示用
@@ -631,26 +750,38 @@ class DbHelper {
   }
 
   // 2. 查询所有日记（支持搜索关键词）
-  Future<List<Map<String, dynamic>>> getDiaries({String? keyword}) async {
+  Future<List<Map<String, dynamic>>> getDiaries({
+    String? keyword,
+    String? tag,
+  }) async {
     final dbClient = await db;
+    // 搜索关键词与标注筛选可叠加（AND）；tag 为 null 时不过滤（=全部）
+    final conditions = <String>[];
+    final args = <dynamic>[];
     if (keyword != null && keyword.isNotEmpty) {
-      return await dbClient.rawQuery(
-        '''
-        SELECT * FROM diary
-        WHERE content LIKE ?
-        ORDER BY
-          is_archived ASC,
-          created_at DESC
-      ''',
-        ['%$keyword%'],
-      );
+      conditions.add('content LIKE ?');
+      args.add('%$keyword%');
     }
+    if (tag != null) {
+      conditions.add('tag = ?');
+      args.add(tag);
+    }
+    final whereSql = conditions.isEmpty
+        ? ''
+        : "WHERE ${conditions.join(' AND ')}";
+    // 排序语义：活跃区（is_archived=0）在前，区内按 sort_order 升序
+    //（越小越靠前，悬浮窗长按拖动排序的结果）；漏网的 NULL 行（回填前
+    // 存量/异常写入）排活跃区尾部按时间倒序，显示不错乱、首次重排即
+    // 规范化。归档区行 sort_order 恒 NULL → 全按 created_at DESC（现状不变）
     return await dbClient.rawQuery('''
       SELECT * FROM diary
+      $whereSql
       ORDER BY
         is_archived ASC,
+        (sort_order IS NULL) ASC,
+        sort_order ASC,
         created_at DESC
-    ''');
+    ''', args);
   }
 
   // 按 id 查单条日记（电脑访问服务 PUT/DELETE 前定位 audio_path 用，见
@@ -688,11 +819,13 @@ class DbHelper {
   }
 
   // 归档日记（删除音频文件，标记归档状态）
+  // 归档即清出排序域：sort_order 置 NULL（sort_order 仅活跃区有意义，
+  // 归档区恒 NULL → 归档区全按 created_at DESC）
   Future<int> archiveDiary(int id) async {
     final dbClient = await db;
     final count = await dbClient.update(
       'diary',
-      {'is_archived': 1},
+      {'is_archived': 1, 'sort_order': null},
       where: 'id = ?',
       whereArgs: [id],
     );
@@ -700,17 +833,46 @@ class DbHelper {
     return count;
   }
 
-  // 恢复日记（将 is_archived 标记为 0）
+  // 恢复日记（将 is_archived 标记为 0）：回活跃区顶部
+  //（sort_order 取当前最小值-1，与新插入卡同款语义）
   Future<int> restoreDiary(int id) async {
     final dbClient = await db;
     final count = await dbClient.update(
       'diary',
-      {'is_archived': 0},
+      {'is_archived': 0, 'sort_order': await _nextTopSortOrder(dbClient)},
       where: 'id = ?',
       whereArgs: [id],
     );
     unawaited(CloudSyncDataVersion.bump());
     return count;
+  }
+
+  /// 重排活跃区（悬浮窗长按拖动排序的写库口）：
+  /// orderedActiveIds = 重排后活跃区 diary id 顺序（顶→底）。事务内把整个
+  /// 活跃区 sort_order 规范重写——orderedActiveIds 按序得 0..n-1；不在
+  /// 列表里的活跃行（并发新增等漏网）按 created_at DESC 续排其后。
+  /// 归档行不参与（归档区 sort_order 恒 NULL）。
+  /// 调用方：OverlayHome 长按拖动排序 onReorder；主 App 日记页经
+  /// DiarySyncBridge 计数比对自动跟随（由调用方 bump DiarySyncBridge）
+  Future<void> reorderActiveDiaries(List<int> orderedActiveIds) async {
+    final dbClient = await db;
+    await dbClient.transaction((txn) async {
+      final stray = await txn.query('diary',
+          columns: ['id'], where: 'is_archived = 0', orderBy: 'created_at DESC');
+      final ordered = <int>[...orderedActiveIds];
+      final seen = ordered.toSet();
+      for (final r in stray) {
+        final id = r['id'] as int;
+        if (!seen.contains(id)) ordered.add(id);
+      }
+      final batch = txn.batch();
+      for (var i = 0; i < ordered.length; i++) {
+        batch.update('diary', {'sort_order': i},
+            where: 'id = ? AND is_archived = 0', whereArgs: [ordered[i]]);
+      }
+      await batch.commit(noResult: true);
+    });
+    unawaited(CloudSyncDataVersion.bump()); // 顺序随同步载荷上云，算变更
   }
 
   // 4. 更新日记内容
@@ -825,6 +987,9 @@ class DbHelper {
         // 归档位随备份走（2026-09 修复：此前 CSV 不含归档列，导入行走 DDL
         // 默认 0，归档笔记恢复后全部复活成活跃）
         'is_archived': diary['is_archived'] ?? 0,
+        // 排序键随备份走（v16 起 CSV 第 8 列；旧备份缺列解析为 null，
+        // 活跃区 NULL 行由首开回填按时间兜底，归档行本来就恒 NULL）
+        'sort_order': diary['sort_order'],
         // 备份 CSV 不带 uuid，导入行生成新身份（内容级去重在导入方做）
         'sync_uuid': const Uuid().v4(),
       });
@@ -1216,8 +1381,26 @@ class DbHelper {
   Future<int> insertRemoteDiaries(List<Map<String, dynamic>> diaries) async {
     if (diaries.isEmpty) return 0;
     final dbClient = await db;
+    // 排序决策：本地活跃区为空（换机全量恢复）→ 尊重远端 sort_order
+    //（NULL 的行由首开回填按时间兜底）；本地活跃区非空 → 远端新行统一
+    // 堆顶部（min-1 递减系列，行间相对顺序 = created_at DESC）——
+    // 远端 sort_order 在本端无意义，与本端已有条目撞值会交错混杂。
+    // 注意：调用方传入行顺序是云端 JSON 文件序，需在这里先排好再依次赋值；
+    // ⚠️ 迭代方向同 _backfillSortOrder 必须 created_at ASC（最旧新行拿
+    // min-1、最新新行拿系列最小值），DESC 迭代会把新行内部顺序颠倒
+    final activeCount = Sqflite.firstIntValue(await dbClient.rawQuery(
+            'SELECT COUNT(*) FROM diary WHERE is_archived = 0')) ??
+        0;
+    var nextOrder = 0;
+    List<Map<String, dynamic>> rows = diaries;
+    if (activeCount > 0) {
+      nextOrder = await _nextTopSortOrder(dbClient);
+      rows = [...diaries]
+        ..sort((a, b) => (a['created_at'] as String? ?? '')
+            .compareTo(b['created_at'] as String? ?? ''));
+    }
     final batch = dbClient.batch();
-    for (final d in diaries) {
+    for (final d in rows) {
       batch.insert('diary', {
         'content': d['content'],
         'created_at': d['created_at'],
@@ -1229,6 +1412,10 @@ class DbHelper {
         'is_locked': d['is_locked'] ?? 0,
         'tag': d['tag'],
         'sync_uuid': d['sync_uuid'],
+        // 归档行恒 NULL；活跃行按上文排序决策赋值
+        'sort_order': (d['is_archived'] ?? 0) != 0
+            ? null
+            : (activeCount == 0 ? d['sort_order'] : nextOrder--),
       }, conflictAlgorithm: ConflictAlgorithm.ignore);
     }
     await batch.commit(noResult: true);

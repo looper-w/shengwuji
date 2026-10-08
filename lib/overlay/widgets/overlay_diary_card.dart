@@ -15,8 +15,9 @@ import '../overlay_constants.dart';
 const double _kExpandedCheckboxHitSize = 28;
 const double _kExpandedCheckboxRightGap = 8;
 
-/// 收起态文字宽度测量缓存（性能审查 Top7）：key = 文本+textScaler+fontFamily，
-/// 值 = TextPainter 单行 intrinsic 宽。同一张卡在面板宽度补间/归档删除等任意
+/// 收起态文字宽度测量缓存（性能审查 Top7）：key = 文本+textScaler+fontFamily+
+/// 字号（2026-09-27 字体大小档位加入——不同档位的同文本宽度不同，不进 key
+/// 会串档），值 = TextPainter 单行 intrinsic 宽。同一张卡在面板宽度补间/归档删除等任意
 /// setState 重测期间输入不变——直接命中缓存跳过全文 shaping，而逐帧 clamp
 /// （cardMinWidth~maxWidth）照做，补间逐帧像素与不缓存时完全一致。
 /// 上限 512 条：超出整体清空（悬浮窗会话内卡片数有限，正常到不了；只防
@@ -28,14 +29,16 @@ int _collapsedTextWidthMeasureCount = 0;
 
 /// 收起态文字单行 intrinsic 宽测量（带缓存）。度量环境必须与实际渲染
 /// 严格一致——textScaler / fontFamily 由调用方从 MediaQuery/DefaultTextStyle
-/// 取实际值传入（046fe0b 起估算值兼任收起态稳态宽度上限，估算偏窄会把
-/// 短文字顶出省略号），因此二者必须参与缓存 key。
+/// 取实际值传入，[fontSize] 取字号档位缩放后的实际值（046fe0b 起估算值
+/// 兼任收起态稳态宽度上限，估算偏窄会把短文字顶出省略号），因此三者必须
+/// 参与缓存 key。
 double _measureCollapsedTextWidth(
   String text,
   TextScaler textScaler,
   String? fontFamily,
+  double fontSize,
 ) {
-  final String key = '$text\u0000$textScaler\u0000${fontFamily ?? ''}';
+  final String key = '$text\u0000$textScaler\u0000${fontFamily ?? ''}\u0000$fontSize';
   final double? cached = _kCollapsedTextWidthCache[key];
   if (cached != null) return cached;
   double textWidth = 0.0;
@@ -44,7 +47,7 @@ double _measureCollapsedTextWidth(
       text: TextSpan(
         text: text,
         style: TextStyle(
-          fontSize: OverlayConstants.cardCollapsedFontSize,
+          fontSize: fontSize,
           fontFamily: fontFamily,
         ),
       ),
@@ -147,6 +150,12 @@ class OverlayDiaryCard extends StatelessWidget {
   ///（content 为空的转写占位行等场景）
   final ValueChanged<int>? onTextTap;
 
+  /// 查看态正文长按回调（大爆炸分词层入口，big_bang_layer.dart）。
+  /// 与 [onTextTap] 的点按进编辑靠手势竞技场自然分流：点按走 [onTextTap]
+  ///（up 触发）、长按走本回调。空内容占位行/锁定打码卡父层传 null（长按
+  /// 无反应）
+  final VoidCallback? onLongPressText;
+
   /// 编辑态底部按钮条回调：✓保存 / ✗取消
   final VoidCallback? onEditSave;
   final VoidCallback? onEditCancel;
@@ -176,6 +185,14 @@ class OverlayDiaryCard extends StatelessWidget {
   /// 翻转，两种停靠下内容阅读一致）
   final bool dockLeft;
 
+  /// 字体大小档位（-2~+2，0=标准，每档 1pt，设置页悬浮窗二级页配置）。
+  /// 真值在父层 OverlayHome._fontSizeStep（prefs overlay_font_size_step，
+  /// 下一次展开/收起状态转换生效）。卡内全部文字（收起胶囊/时间行/正文/
+  /// 编辑态/重放行/删除确认行）与文字测量（宽度估算/点击偏移换算/展开高度
+  /// 估算）统一经 OverlayConstants.fontScaled 缩放——测量与渲染同值是
+  /// 046fe0b 的不变量（估算偏窄会把短文字顶出省略号）
+  final int fontSizeStep;
+
   const OverlayDiaryCard({
     super.key,
     required this.diary,
@@ -195,6 +212,7 @@ class OverlayDiaryCard extends StatelessWidget {
     this.editController,
     this.editFocusNode,
     this.onTextTap,
+    this.onLongPressText,
     this.onEditSave,
     this.onEditCancel,
     this.onTagToggle,
@@ -203,19 +221,24 @@ class OverlayDiaryCard extends StatelessWidget {
     this.onTap,
     this.onLongPress,
     this.dockLeft = false,
+    this.fontSizeStep = OverlayConstants.fontSizeStepDefault,
   });
 
   /// 测试探针：收起态文字宽度实际执行 TextPainter.layout 的次数（Top7 缓存验证）
   @visibleForTesting
   static int get collapsedTextMeasureCount => _collapsedTextWidthMeasureCount;
 
+  /// 字号档位缩放简写：基准 + fontSizeStep（每档 1pt），渲染与测量共用
+  double _fs(double base) => OverlayConstants.fontScaled(base, fontSizeStep);
+
   /// 测试入口：直接调用带缓存的收起态文字测量
   @visibleForTesting
   static double measureCollapsedTextWidthForTest(
     String text,
     TextScaler textScaler,
-    String? fontFamily,
-  ) => _measureCollapsedTextWidth(text, textScaler, fontFamily);
+    String? fontFamily, {
+    double fontSize = OverlayConstants.cardCollapsedFontSize,
+  }) => _measureCollapsedTextWidth(text, textScaler, fontFamily, fontSize);
 
   @override
   Widget build(BuildContext context) {
@@ -576,7 +599,7 @@ class OverlayDiaryCard extends StatelessWidget {
                                 // 收起态专用小字号（比展开态小 2），保证胶囊达
                                 // 最大宽度时能显示约 9 个汉字 + 省略号
                                 fontSize:
-                                    OverlayConstants.cardCollapsedFontSize,
+                                    _fs(OverlayConstants.cardCollapsedFontSize),
                                 color: Colors.white,
                                 decoration: isArchived
                                     ? TextDecoration.lineThrough
@@ -652,7 +675,7 @@ class OverlayDiaryCard extends StatelessWidget {
               Text(
                 timeText,
                 style: TextStyle(
-                  fontSize: 12,
+                  fontSize: _fs(12),
                   color: Colors.white.withValues(alpha: 0.75),
                 ),
               ),
@@ -766,7 +789,7 @@ class OverlayDiaryCard extends StatelessWidget {
                           Text(
                             '重放录音',
                             style: TextStyle(
-                              fontSize: 13,
+                              fontSize: _fs(13),
                               color: Colors.white.withValues(alpha: 0.9),
                             ),
                           ),
@@ -806,7 +829,7 @@ class OverlayDiaryCard extends StatelessWidget {
         Text(
           kLockedMaskText,
           style: TextStyle(
-            fontSize: OverlayConstants.cardFontSize,
+            fontSize: _fs(OverlayConstants.cardFontSize),
             height: 1.4,
             color: Colors.white.withValues(alpha: 0.95),
             letterSpacing: 2,
@@ -817,9 +840,12 @@ class OverlayDiaryCard extends StatelessWidget {
   }
 
   /// 查看态正文：勾选框 WidgetSpan 内联首行（归档划线样式与收起态一致）。
-  /// [onTextTap] 非空时外包 GestureDetector(onTapDown)：把点击位置用
-  /// TextPainter 换算成字符偏移回调给父层（进入编辑态、光标定位到点击处；
-  /// -1 哨兵 = 点击落在勾选框占位区，父层跳过进编辑——点勾选框走归档回调）。
+  /// [onTextTap] 非空时外包 GestureDetector：点按把点击位置用 TextPainter
+  /// 换算成字符偏移回调给父层（进入编辑态、光标定位到点击处；-1 哨兵 =
+  /// 点击落在勾选框占位区，父层跳过进编辑——点勾选框走归档回调）；长按
+  /// 走 [onLongPressText]（大爆炸分词层）。⚠️ 点按必须用 onTap（up 触发）
+  /// 而非 onTapDown——down 触发会抢在长按压住之前先进编辑态，两个回调靠
+  /// 手势竞技场分流的前提是 tap 等抬起。
   /// GestureDetector 只包正文本身（localPosition 天然相对正文左上角）；
   /// 换算精度见 _charOffsetAt——占位尺寸与下方勾选框同源（_kExpandedCheckbox*
   /// 常量），首行缩进与真实渲染逐像素一致
@@ -836,9 +862,12 @@ class OverlayDiaryCard extends StatelessWidget {
     // 时除数即 1，渲染零变化。_charOffsetAt/_estimateExpandedHeight 的占位
     // 常量保持逻辑尺寸（28/8）不变——补偿后占位盒放大回来正是 36×28，与
     // 换算 TextPainter 声明一致
+    // 换算倍率的正文字号须取档位缩放后的实际值（与下方正文 TextSpan 同值），
+    // 否则框架按 textScaler.scale(缩放后字号)/缩放后字号 放大、本侧按未缩放
+    // 基准反缩放，档位非 0 时勾选框尺寸被二次偏差
+    final double bodyFontSize = _fs(OverlayConstants.cardFontSize);
     final double fontScale =
-        textScaler.scale(OverlayConstants.cardFontSize) /
-        OverlayConstants.cardFontSize;
+        textScaler.scale(bodyFontSize) / bodyFontSize;
     final body = Text.rich(
       TextSpan(
         children: [
@@ -861,7 +890,7 @@ class OverlayDiaryCard extends StatelessWidget {
         ],
       ),
       style: TextStyle(
-        fontSize: OverlayConstants.cardFontSize,
+        fontSize: _fs(OverlayConstants.cardFontSize),
         color: Colors.white,
         height: 1.4,
         decoration: isArchived ? TextDecoration.lineThrough : null,
@@ -878,7 +907,7 @@ class OverlayDiaryCard extends StatelessWidget {
         return GestureDetector(
           // opaque：行尾空白处点击也进入编辑（段落命中区 = 整段包围盒）
           behavior: HitTestBehavior.opaque,
-          onTapDown: (details) => onTextTap!(
+          onTapUp: (details) => onTextTap!(
             _charOffsetAt(
               content,
               details.localPosition,
@@ -887,6 +916,7 @@ class OverlayDiaryCard extends StatelessWidget {
               fontFamily,
             ),
           ),
+          onLongPress: onLongPressText,
           child: body,
         );
       },
@@ -924,7 +954,7 @@ class OverlayDiaryCard extends StatelessWidget {
             TextSpan(text: content),
           ],
           style: TextStyle(
-            fontSize: OverlayConstants.cardFontSize,
+            fontSize: _fs(OverlayConstants.cardFontSize),
             height: 1.4,
             fontFamily: fontFamily,
           ),
@@ -989,6 +1019,7 @@ class OverlayDiaryCard extends StatelessWidget {
       content,
       textScaler,
       fontFamily,
+      _fs(OverlayConstants.cardCollapsedFontSize),
     );
     final double raw =
         2 * OverlayConstants.cardHPadding +
@@ -1039,7 +1070,7 @@ class OverlayDiaryCard extends StatelessWidget {
             TextSpan(text: content),
           ],
           style: TextStyle(
-            fontSize: OverlayConstants.cardFontSize,
+            fontSize: _fs(OverlayConstants.cardFontSize),
             height: 1.4,
             fontFamily: fontFamily,
           ),
@@ -1089,7 +1120,7 @@ class OverlayDiaryCard extends StatelessWidget {
       keyboardType: TextInputType.multiline,
       cursorColor: Colors.white,
       style: TextStyle(
-        fontSize: OverlayConstants.cardFontSize,
+        fontSize: _fs(OverlayConstants.cardFontSize),
         color: Colors.white,
         height: 1.4,
       ),
@@ -1167,7 +1198,7 @@ class OverlayDiaryCard extends StatelessWidget {
         Text(
           '确认删除？',
           style: TextStyle(
-            fontSize: 13,
+            fontSize: _fs(13),
             color: Colors.white.withValues(alpha: 0.9),
           ),
         ),

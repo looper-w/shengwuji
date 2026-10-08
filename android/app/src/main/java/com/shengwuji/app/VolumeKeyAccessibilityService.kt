@@ -1,11 +1,13 @@
 package com.shengwuji.app
 
 import android.accessibilityservice.AccessibilityService
+import android.app.KeyguardManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
 import android.media.AudioManager
 import android.net.Uri
+import android.provider.Settings
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -79,6 +81,12 @@ class VolumeKeyAccessibilityService : AccessibilityService() {
 
         // 双击判定窗口（毫秒）
         private const val DOUBLE_CLICK_THRESHOLD_MS = 300L
+
+        // 「按住连续调音量」接管的初始延迟与重复节奏（ms）。初始延迟对齐系统原生
+        // 按键 repeat 起始（500ms），节奏 100ms/步比原生 50ms 保守一档——本服务
+        // 代为调音量走 AudioManager IPC，过密无收益且音量条跳动过冲
+        private const val HOLD_VOLUME_INITIAL_DELAY_MS = 500L
+        private const val HOLD_VOLUME_REPEAT_INTERVAL_MS = 100L
         // SharedPreferences 相关
         private const val PREFS_NAME = "FlutterSharedPreferences"
 
@@ -214,6 +222,27 @@ class VolumeKeyAccessibilityService : AccessibilityService() {
     private var lastClickKeyCode = 0
     private var pendingSingleClick: Runnable? = null
     private val singleClickHandler = Handler(Looper.getMainLooper())
+
+    // 「按住连续调音量」接管：双击槽占用整键后，系统原生「按住音量键连调」
+    // 失效——原生连调依赖系统自己收到未消费的 DOWN 事件流后产生 repeat，
+    // 而双击检测必须消费整键（第一次单击的调音量要延迟 300ms 确认无第二击），
+    // DOWN 被吃掉系统就永远收不到。故在长按槽=无动作时由本服务代为还原：
+    // DOWN 排定初始延迟，到期按固定节奏重复调音量；UP 撤销。
+    // 用 Handler 自排而非依赖框架 repeat 事件——三星 ROM 不发送重复事件
+    // （longPressHandler 同款考量），且节奏自主可控
+    private var holdVolumeKeyCode = 0
+    // 本次按压是否已用连调表达过意图（repeat 至少发过一次）。UP 据此跳过
+    // 单击/双击状态机——否则抬起会被当第一次单击，300ms 后白跳一格音量
+    private var holdVolumeConsumed = false
+    private val holdVolumeHandler = Handler(Looper.getMainLooper())
+    private val holdVolumeRunnable = object : Runnable {
+        override fun run() {
+            if (holdVolumeKeyCode == 0) return
+            adjustVolume(holdVolumeKeyCode)
+            holdVolumeConsumed = true
+            holdVolumeHandler.postDelayed(this, HOLD_VOLUME_REPEAT_INTERVAL_MS)
+        }
+    }
 
     // 无障碍浮窗（TYPE_ACCESSIBILITY_OVERLAY）
     private var overlayWindowManager: WindowManager? = null
@@ -548,9 +577,29 @@ class VolumeKeyAccessibilityService : AccessibilityService() {
         if (event.action == KeyEvent.ACTION_DOWN) {
             // 消费 ACTION_DOWN，阻止系统音量变化
 
+            // 框架 repeat DOWN（按住时部分 ROM 派发）：整键已被消费，重复事件
+            // 直接吞掉——「按住连调」由 holdVolumeRunnable 自排驱动（三星 ROM
+            // 本就不发重复事件，不能依赖这条路径）
+            if (event.repeatCount > 0) {
+                return true
+            }
+
             // 如果有等待中的单击，取消它（用户又按下了，可能是双击）
             pendingSingleClick?.let { singleClickHandler.removeCallbacks(it) }
             pendingSingleClick = null
+
+            // 长按槽=无动作才接管「按住连调」（长按槽有动作时按住归手势动作）；
+            // 录音中+单击停录开启时不接管——按住该键既不该停录（单击语义在非
+            // repeat 的 UP 生效）也不该调音量，与单击被拦截的状态一致
+            holdVolumeHandler.removeCallbacks(holdVolumeRunnable)
+            holdVolumeKeyCode = 0
+            holdVolumeConsumed = false
+            if (longAction == ACTION_NONE &&
+                !(isSingleClickStopEnabled() && isRecordingActive())
+            ) {
+                holdVolumeKeyCode = event.keyCode
+                holdVolumeHandler.postDelayed(holdVolumeRunnable, HOLD_VOLUME_INITIAL_DELAY_MS)
+            }
 
             // 长按槽有动作才启动长按计时（DOWN 时缓存动作，runnable 执行用；
             // 时长读设置页档位/自定义值，默认 400ms）
@@ -561,13 +610,19 @@ class VolumeKeyAccessibilityService : AccessibilityService() {
                 currentLongPressKeyCode = event.keyCode
                 longPressHandler.postDelayed(longPressRunnable, getLongPressDurationMs())
             }
-            // longAction==none：不启动长按计时，按住不放无动作，UP 走调音量路径
+            // longAction==none：不启动长按计时，按住归「按住连调」接管（上方），UP 走调音量路径
             println("🔑 [Accessibility] 按键按下(已拦截): keyCode=${event.keyCode}, longAction=$longAction, doubleAction=$doubleAction")
             return true
         } else if (event.action == KeyEvent.ACTION_UP) {
             // 取消长按计时
             longPressHandler.removeCallbacks(longPressRunnable)
             currentLongPressAction = null
+            // 撤销「按住连调」计时并结算：repeat 至少发过一次 = 本次按压的意图
+            // 已通过连调表达（键码校验防双键同按时另一键的 UP 误结算）
+            holdVolumeHandler.removeCallbacks(holdVolumeRunnable)
+            val wasHoldVolume = holdVolumeConsumed && holdVolumeKeyCode == keyCode
+            holdVolumeKeyCode = 0
+            holdVolumeConsumed = false
             val wasLongPress = isLongPressTriggered
             val wasPttKeyCode = currentLongPressKeyCode == keyCode
             currentLongPressKeyCode = 0
@@ -582,6 +637,13 @@ class VolumeKeyAccessibilityService : AccessibilityService() {
                 }
                 println("🔑 [Accessibility] 按键抬起: 长按已处理")
                 return true // 长按已处理，不进双击
+            }
+
+            if (wasHoldVolume) {
+                // 按住连调已生效：意图就是调音量，不进单击/双击状态机——否则抬起
+                // 被当第一次单击，300ms 后白跳一格音量，还污染双击计时
+                println("🔑 [Accessibility] 按键抬起: 按住连调已处理")
+                return true
             }
 
             val now = System.currentTimeMillis()
@@ -1305,6 +1367,16 @@ class VolumeKeyAccessibilityService : AccessibilityService() {
                             hideOverlay()
                             result.success(true)
                         }
+                        // 设备诊断信息（悬浮窗把手/竖线不出现定位用）：overlay
+                        // engine 够不着 MainActivity 通道，走服务侧同名采集
+                        //（⚠️ 此处 this 是 apply 的 MethodChannel，须带标签取服务）
+                        "getDeviceDiagnostics" -> {
+                            result.success(
+                                DeviceDiagnostics.collect(
+                                    this@VolumeKeyAccessibilityService
+                                )
+                            )
+                        }
                         // 触觉反馈（Dart → Kotlin）：悬浮窗 UI 的震动反馈走服务实现
                         // （overlay engine 无 Activity，够不着 MainActivity 的
                         // com.shengwuji.app/app 通道）。映射表见 performHaptic
@@ -1635,6 +1707,51 @@ class VolumeKeyAccessibilityService : AccessibilityService() {
                             }
                             result.success(launched)
                         }
+                        // 大爆炸分词层「搜索」按钮：用指定浏览器打开 URL（overlay
+                        // engine 够不着 MainActivity 通道，走服务侧同名实现，同
+                        // getDeviceDiagnostics / performHaptic / launchApp 先例）。
+                        // Service 无 Activity 上下文须加 FLAG_ACTIVITY_NEW_TASK；
+                        // packageName 空 = 系统默认，指定包失败回退系统默认再试一次
+                        "openUrl" -> {
+                            val url = call.argument<String>("url") ?: ""
+                            val packageName = call.argument<String>("packageName") ?: ""
+                            var opened = false
+                            if (url.isNotEmpty() && packageName.isNotEmpty()) {
+                                try {
+                                    startActivity(
+                                        Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                                            setPackage(packageName)
+                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        }
+                                    )
+                                    opened = true
+                                    println("✅ [Accessibility] openUrl 指定浏览器: $packageName")
+                                } catch (e: android.content.ActivityNotFoundException) {
+                                    println("⚠️ [Accessibility] 指定浏览器不可用 $packageName，回退系统默认: $e")
+                                }
+                            }
+                            if (!opened && url.isNotEmpty()) {
+                                try {
+                                    startActivity(
+                                        Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        }
+                                    )
+                                    opened = true
+                                    println("✅ [Accessibility] openUrl 系统默认: $url")
+                                } catch (e: android.content.ActivityNotFoundException) {
+                                    println("❌ [Accessibility] openUrl 失败: $e")
+                                }
+                            }
+                            if (!opened) {
+                                Toast.makeText(
+                                    this@VolumeKeyAccessibilityService,
+                                    "无法打开浏览器",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                            result.success(opened)
+                        }
                         // Dart 侧握手：handler 已注册（overlay_home initState 发出）。
                         // 若此前有挂起的自动展开请求，立即补发 expand
                         "dartReady" -> {
@@ -1717,6 +1834,29 @@ class VolumeKeyAccessibilityService : AccessibilityService() {
                                 fromOverlay = true
                             )
                             if (!ok) setOverlayDimForAuth(false)
+                            result.success(ok)
+                        }
+                        // 笔记加锁前置检查：设备是否已设锁屏凭据（PIN/图案/密码）。
+                        // 未设置时不允许锁定笔记——锁定后没有任何认证手段能看回内容，
+                        // 锁定形同虚设反而误导用户（Dart 侧弹引导对话框）
+                        "isDeviceSecure" -> {
+                            val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+                            result.success(km.isDeviceSecure)
+                        }
+                        // 引导用户去系统「安全」设置页设锁屏密码（加锁引导对话框「去设置」）；
+                        // Service 上下文必须 NEW_TASK（同 openDiaryPage 先例）
+                        "openSecuritySettings" -> {
+                            val ok = try {
+                                startActivity(
+                                    Intent(Settings.ACTION_SECURITY_SETTINGS)
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                )
+                                println("🔒 [Accessibility] 已拉起系统安全设置页")
+                                true
+                            } catch (e: Exception) {
+                                println("❌ [Accessibility] 拉起安全设置页失败: $e")
+                                false
+                            }
                             result.success(ok)
                         }
                         else -> result.notImplemented()
@@ -2114,12 +2254,16 @@ class VolumeKeyAccessibilityService : AccessibilityService() {
         return dpToPx(savedDp).coerceIn(-maxAbsY, maxAbsY)
     }
 
+    // ⚠️ 必须四舍五入不能截断：截断会让窗口实测高比设计值小（88dp @density
+    // 2.8125 = 247.5px → 截 247 → Flutter 侧量到 87.8 < 88），Dart 硬不变量
+    // 「窗口高属胶囊高度档 → idle 帧渲染空白」曾因此误杀把手（真机反馈把手
+    // 不显示；Dart 侧判定已加阈值容差，此处四舍五入再减一层踩坑概率）
     private fun dpToPx(dp: Int): Int {
         return TypedValue.applyDimension(
             TypedValue.COMPLEX_UNIT_DIP,
             dp.toFloat(),
             resources.displayMetrics
-        ).toInt()
+        ).roundToInt()
     }
 
     // 小数 dp 版（dragHandle 的位移是 Dart 逻辑像素 = dp，逐帧换算取整即可）
@@ -2281,6 +2425,10 @@ class VolumeKeyAccessibilityService : AccessibilityService() {
         singleClickHandler.removeCallbacksAndMessages(null)
         // 补上长按计时的对称清理（此前只清单击，长按 runnable 可能残留触发）
         longPressHandler.removeCallbacksAndMessages(null)
+        // 「按住连调」计时同款对称清理
+        holdVolumeHandler.removeCallbacksAndMessages(null)
+        holdVolumeKeyCode = 0
+        holdVolumeConsumed = false
         currentLongPressAction = null
         isLongPressTriggered = false
         println("⚠️ [Accessibility] 无障碍服务被中断")

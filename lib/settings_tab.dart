@@ -39,6 +39,8 @@ import 'settings/cloud_sync_page.dart';
 import 'settings/custom_theme_page.dart'; // 自定义主题编辑页（选色盘 + 推荐色系）
 import 'settings/overlay_settings_page.dart';
 import 'settings/recognition_correction_page.dart';
+import 'settings/search_settings_page.dart'; // 大爆炸搜索二级页
+import 'utils/big_bang_search.dart'; // 搜索引擎/浏览器 prefs key 与显示名唯一真值
 import 'settings/settings_widgets.dart';
 import 'widgets/neu_widgets.dart';
 import 'settings/volume_key_settings_page.dart';
@@ -67,6 +69,8 @@ class SettingsTabState extends State<SettingsTab> with WidgetsBindingObserver {
   // 「AI 应用分享」入口行摘要：当前选中的应用（内置或二级页 + 号添加的自定义）；
   // 异步解析（resolveAppById），加载完成前显示默认项
   AIApp _selectedAIApp = AIApp.defaultApp;
+  // 「大爆炸搜索」入口行摘要：当前搜索引擎 · 浏览器（二级页写 prefs，本页只读）
+  String _searchSummary = '百度 · 系统默认';
   // 无障碍服务是否已开启（null=检测失败：与「未开启」区分，UI 显式提示而非误导用户去开无障碍——服务可能明明开着）
   bool? _isAccessibilityEnabled = false;
   int _hotwordCount = 0; // 「识别与修正」入口行摘要：热词条数
@@ -81,7 +85,7 @@ class SettingsTabState extends State<SettingsTab> with WidgetsBindingObserver {
   String _currentIconPackId = 'default'; // 当前图标包 ID（从原生层读取，不依赖 prefs），Phase 4
   bool _itemTransferEnabled = true; // 日记智能识别物品+位置开关（默认开启）
   bool _queryAnswerEnabled = true; // 日记智能查询物品位置开关（默认开启）
-  bool _swapTapLongPress = false; // 日记卡片单击/长按交换开关
+  bool _swapTapLongPress = false; // 日记卡片单击/双击交换开关（prefs key 是历史名 diary_card_swap_tap_longpress，不可改）
   bool _recordTabHidden = false; // 功能页面：隐藏存物品页开关（prefKeyRecordTabHidden，main.dart main() 预读，重启生效）
   bool _listTabHidden = false; // 功能页面：隐藏查物品页开关（prefKeyListTabHidden，同上）
   int _overlayAutoHideSeconds = OverlayConstants
@@ -90,6 +94,9 @@ class SettingsTabState extends State<SettingsTab> with WidgetsBindingObserver {
       false; // 悬浮窗入口行摘要：停靠侧（OverlayConstants.overlaySideLeftPrefKey：false=右缘/true=左缘）
   // 字号缩放档位（外观分区选择器；默认 1.0 中档）
   double _fontScale = 1.0;
+
+  // 深色模式档位（外观分区选择器；默认跟随系统）
+  ThemeMode _themeMode = ThemeMode.system;
 
   /// 启动耗时诊断 UI 开关（暂时隐藏，需要时改为 true）
   static const bool _kShowStartupDiagnostics = false;
@@ -100,6 +107,7 @@ class SettingsTabState extends State<SettingsTab> with WidgetsBindingObserver {
     _loadHotwordCount();
     _loadModelStatus();
     _loadAIAppPreference(); // 加载 AI 应用偏好（入口行摘要）
+    _loadSearchSummary(); // 加载大爆炸搜索入口行摘要（引擎 · 浏览器）
     _loadAppVersion(); // 加载应用版本号（关于入口行）
     _loadProUnlockStatus(); // 加载 Pro 解锁状态
     _loadCurrentIconPack(); // Phase 4：从原生层加载当前图标包状态
@@ -107,6 +115,7 @@ class SettingsTabState extends State<SettingsTab> with WidgetsBindingObserver {
     _loadTabVisibility(); // 加载功能页面隐藏开关
     _loadOverlaySummary(); // 加载悬浮窗入口行摘要（停靠侧 + 自动隐藏）
     _loadFontScale(); // 加载全局字号缩放档位
+    _loadThemeMode(); // 加载深色模式档位
     _loadCorrectionPairCount(); // 加载错误-修正学习表条数（入口行摘要）
     _loadCloudSyncSummary(); // 加载云端同步入口行摘要（是否配置 + 上次同步）
     WidgetsBinding.instance.addObserver(this);
@@ -252,6 +261,24 @@ class SettingsTabState extends State<SettingsTab> with WidgetsBindingObserver {
     setState(() => _fontScale = scale);
   }
 
+  /// 加载深色模式档位（读取方：AppRoot 的 themeModeNotifier，启动时 main() 已预读）
+  void _loadThemeMode() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (mounted) {
+      setState(() {
+        _themeMode = parseThemeMode(prefs.getString(kThemeModePrefKey));
+      });
+    }
+  }
+
+  /// 保存深色模式档位（写 prefs 持久化 + 立即触发整树重建）
+  Future<void> _saveThemeMode(ThemeMode mode) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(kThemeModePrefKey, mode.name);
+    AppRoot.themeModeNotifier.value = mode; // 立即触发整树重建
+    setState(() => _themeMode = mode);
+  }
+
   /// 显示 Pro 解锁弹窗，关闭后刷新按钮文案
   void _showProUnlockDialog() async {
     await ProUnlockDialog.show(context);
@@ -346,6 +373,28 @@ class SettingsTabState extends State<SettingsTab> with WidgetsBindingObserver {
     _loadAIAppPreference(); // 摘要跟随二级页的选择
   }
 
+  /// 加载「大爆炸搜索」入口行副标题：搜索引擎显示名 · 浏览器名（空=系统默认）
+  Future<void> _loadSearchSummary() async {
+    final prefs = await SharedPreferences.getInstance();
+    final engineName =
+        searchEngines[parseSearchEngine(prefs.getString(kSearchEngineKey))]!
+            .label;
+    final browserPackage = prefs.getString(kSearchBrowserPackageKey) ?? '';
+    final browserName = prefs.getString(kSearchBrowserNameKey) ?? '';
+    final browserLabel =
+        (browserPackage.isEmpty || browserName.isEmpty) ? '系统默认' : browserName;
+    if (!mounted) return;
+    setState(() => _searchSummary = '$engineName · $browserLabel');
+  }
+
+  Future<void> _openSearchSettingsPage() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const SearchSettingsPage()),
+    );
+    _loadSearchSummary(); // 摘要跟随二级页的选择
+  }
+
   Future<void> _openVolumeKeyPage() async {
     await Navigator.push(
       context,
@@ -376,7 +425,7 @@ class SettingsTabState extends State<SettingsTab> with WidgetsBindingObserver {
       // 回退：使用 pubspec.yaml 中的硬编码版本号
       if (mounted) {
         setState(() {
-          _appVersion = '1.4.0'; // 来自 pubspec.yaml version: 1.4.0+25
+          _appVersion = '1.5.0'; // 来自 pubspec.yaml version: 1.5.0+26
         });
       }
     }
@@ -1042,6 +1091,18 @@ class SettingsTabState extends State<SettingsTab> with WidgetsBindingObserver {
           ),
           const SizedBox(height: 12),
 
+          // --- 大爆炸搜索（引擎/浏览器选择下沉二级页）---
+          SettingsCard(
+            padding: EdgeInsets.zero,
+            child: SettingsEntryRow(
+              icon: Icons.travel_explore,
+              title: '大爆炸搜索',
+              subtitle: _searchSummary,
+              onTap: _openSearchSettingsPage,
+            ),
+          ),
+          const SizedBox(height: 12),
+
           // --- 音量键快捷操作（下沉二级页，zcode: 2026-09；入口行保留无障碍状态点，
           // resume 后本页自动重查——检测失败误报修复见 15826e9）---
           SettingsCard(
@@ -1129,9 +1190,9 @@ class SettingsTabState extends State<SettingsTab> with WidgetsBindingObserver {
                 const Divider(height: 1),
                 buildSettingsSwitchTile(
                   context,
-                  title: const Text('交换单击与长按', style: TextStyle(fontSize: 13)),
+                  title: const Text('交换单击与双击', style: TextStyle(fontSize: 13)),
                   subtitle: Text(
-                    '开启后：单击=编辑、长按=复制（默认：单击=复制、长按=编辑）。修改后需重启 App 生效',
+                    '开启后：单击=编辑、双击=复制（默认：单击=复制、双击=编辑）；长按=大爆炸分词不受开关影响。修改后需重启 App 生效',
                     style: TextStyle(fontSize: 11, color: ext.textHint),
                   ),
                   value: _swapTapLongPress,
@@ -1252,6 +1313,8 @@ class SettingsTabState extends State<SettingsTab> with WidgetsBindingObserver {
             child: Column(
               children: [
                 _buildThemeEntry(), // Phase 3
+                const Divider(height: 1),
+                _buildDarkModeEntry(), // 深色模式三档
                 const Divider(height: 1),
                 _buildIconPackEntry(), // Phase 4 新增
                 const Divider(height: 1),
@@ -1840,6 +1903,87 @@ class SettingsTabState extends State<SettingsTab> with WidgetsBindingObserver {
             fontSize: 13,
           ),
           onSelected: (_) => _saveFontScale(scale),
+        );
+      }).toList(),
+    );
+  }
+
+  /// 深色模式入口（两行：标题行 + 三档 chips 行，与 _buildFontSizeEntry 同款
+  /// 布局——单行方案已被字号「特大」档撑爆教训否决，见 _buildFontSizeEntry 注释）
+  Widget _buildDarkModeEntry() {
+    final ext = AppThemeExtension.of(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.dark_mode_outlined, color: ext.primary, size: 22),
+              const SizedBox(width: 14),
+              Text('深色模式', style: TextStyle(fontSize: 15, color: ext.textPrimary)),
+            ],
+          ),
+          const SizedBox(height: 10),
+          _buildDarkModeSelector(),
+        ],
+      ),
+    );
+  }
+
+  /// 深色模式三档选择器（跟随系统/浅色/深色；仿 _buildFontSizeSelector）
+  Widget _buildDarkModeSelector() {
+    final ext = AppThemeExtension.of(context);
+    final options = [
+      (ThemeMode.system, '跟随系统'),
+      (ThemeMode.light, '浅色'),
+      (ThemeMode.dark, '深色'),
+    ];
+    return Wrap(
+      spacing: 8,
+      runSpacing: 6,
+      children: options.map((opt) {
+        final (mode, label) = opt;
+        final selected = _themeMode == mode;
+        // 拟物主题：选中=凹陷+品牌青字、未选=凸起（同 _buildFontSizeSelector 先例）
+        if (ext.isNeumorphic) {
+          final labelStyle = TextStyle(
+            fontSize: 13,
+            fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+            color: selected ? ext.primaryDark : ext.textPrimary,
+          );
+          return GestureDetector(
+            onTap: () => _saveThemeMode(mode),
+            child: selected
+                ? NeuInset(
+                    radius: 999,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                    child: Text(label, style: labelStyle),
+                  )
+                : Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                    decoration: neuRaisedDecoration(context, radius: 999),
+                    child: Text(label, style: labelStyle),
+                  ),
+          );
+        }
+        return ChoiceChip(
+          label: Text(label),
+          labelPadding: const EdgeInsets.symmetric(horizontal: 8),
+          showCheckmark: false,
+          selected: selected,
+          selectedColor: ext.primary,
+          labelStyle: TextStyle(
+            color: selected ? ext.textOnPrimary : ext.textPrimary,
+            fontSize: 13,
+          ),
+          onSelected: (_) => _saveThemeMode(mode),
         );
       }).toList(),
     );

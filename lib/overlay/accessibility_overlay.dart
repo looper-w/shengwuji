@@ -37,6 +37,19 @@ class AccessibilityOverlay {
     await _channel.invokeMethod('closeOverlay');
   }
 
+  /// 设备诊断信息（悬浮窗把手/竖线不出现的问题定位用）：品牌/型号/屏幕/
+  /// 导航模式/权限快照/已启用无障碍服务，采集口径与隐私纪律见原生
+  /// DeviceDiagnostics.kt 头注释。返回 null = 通道异常（调用方按读取失败记日志）。
+  /// 调用方：DeviceDiagnosticsLogger.logOnce（悬浮窗 engine 启动时记一次）
+  static Future<Map<dynamic, dynamic>?> getDeviceDiagnostics() async {
+    try {
+      final raw = await _channel.invokeMethod('getDeviceDiagnostics');
+      return raw is Map ? raw : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// 注册原生→Dart 消息（expand / reset / startVoiceMemo / stopVoiceMemo /
   /// newNote / showProLockedHint / relockNotes / noteUnlockResult）。
   /// 原生 showOverlay(autoExpand: true) 若早于本注册到达会被静默丢弃，
@@ -187,6 +200,21 @@ class AccessibilityOverlay {
     return ok == true;
   }
 
+  /// 打开网页 URL（悬浮窗无 Activity，由原生 Service 侧 startActivity，
+  /// 内部统一加 FLAG_ACTIVITY_NEW_TASK）。[packageName] 空串 = 系统默认
+  /// 浏览器。返回 true = 已拉起。
+  /// 调用方：OverlayHome 大爆炸分词层 onSearch（搜索选中词块）
+  static Future<bool> openUrl({
+    required String url,
+    String packageName = '',
+  }) async {
+    final ok = await _channel.invokeMethod('openUrl', {
+      'url': url,
+      'packageName': packageName,
+    });
+    return ok == true;
+  }
+
   /// 拉起主 App 并路由到日记页（悬浮窗 header「打开随手记」按钮）。
   /// 原生 launcher intent 带 type=open_diary extra，MainActivity
   /// extractShortcutType 路由到 Dart onShortcutLaunch 切日记页（main.dart
@@ -222,6 +250,31 @@ class AccessibilityOverlay {
   /// 调用方：OverlayHome._ensureNoteUnlocked（锁定卡片的内容级操作门禁）
   static Future<bool> requestUnlockAuth() async {
     return await _channel.invokeMethod('requestUnlockAuth') == true;
+  }
+
+  /// 设备是否已设置锁屏凭据（PIN/图案/密码）。笔记**加锁**前置检查——
+  /// 未设置时不允许锁定：锁定后没有任何认证手段能看回内容，锁定形同虚设
+  /// 反而误导用户以为已保护。通道异常按「未设置」兜底（安全侧失败关闭）。
+  /// 调用方：OverlayHome._toggleDiaryLock（卡片底条锁按钮）
+  static Future<bool> isDeviceSecure() async {
+    try {
+      return await _channel.invokeMethod('isDeviceSecure') == true;
+    } catch (e) {
+      print('❌ [AccessibilityOverlay] 查询锁屏凭据失败: $e');
+      return false;
+    }
+  }
+
+  /// 拉起系统「安全」设置页（加锁引导对话框「去设置」按钮，引导用户先设
+  /// 锁屏密码再回来锁定；Service 侧 startActivity 自带 NEW_TASK）。
+  /// 返回 true = 已拉起
+  static Future<bool> openSecuritySettings() async {
+    try {
+      return await _channel.invokeMethod('openSecuritySettings') == true;
+    } catch (e) {
+      print('❌ [AccessibilityOverlay] 拉起安全设置页失败: $e');
+      return false;
+    }
   }
 
   // ── 把手长按拖动（收起态位置调整）──

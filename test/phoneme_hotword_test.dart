@@ -157,11 +157,28 @@ void main() {
       expect(r.text, '在次卧睡觉');
     });
 
-    test('原地匹配只占位不替换', () {
+    test('原地匹配只占位不替换，且不进提示', () {
+      // 2026-09-25 修复：模型本来就没识别错（钥匙在客厅），热词「客厅」
+      // 原地 100% 命中——提示通道此前漏了与替换通道「原地不替换」对齐的
+      // 过滤，弹「客厅听起来像客厅」的废话提示
       final c = build(['麦当劳']);
       final r = c.correct('麦当劳真好吃');
       expect(r.text, '麦当劳真好吃');
       expect(r.matches, isEmpty);
+      expect(r.similars, isEmpty);
+    });
+
+    test('同音错字 100% 相似仍提示（100% 只是发音一致≠同一个词）', () {
+      // 「再」「在」同音同调 dist=0 → score=1.0，但 3 音素 <4 被短热词
+      // 保险丝拦下进提示；逐字不同（再≠在）所以必须提示——过滤条件是
+      // 字符串相等而非分数到顶
+      final c = build(['在'], threshold: 0.7);
+      final r = c.correct('钥匙再桌上');
+      expect(r.text, '钥匙再桌上');
+      expect(r.similars, hasLength(1));
+      expect(r.similars.first.original, '再');
+      expect(r.similars.first.hotword, '在');
+      expect(r.similars.first.score, 1.0);
     });
 
     test('冲突解决：分数高的热词赢，重叠区间丢弃低分', () {

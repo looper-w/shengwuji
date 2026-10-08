@@ -5,7 +5,7 @@
 使用 SQLite 通过 `sqflite` 包实现数据持久化。
 
 ### 数据库版本
-- **当前版本**: 15
+- **当前版本**: 16
 - **定义位置**: [lib/db_helper.dart](../lib/db_helper.dart)
 
 ## 数据表
@@ -34,7 +34,8 @@
 | exported_at | TEXT | 增量导出时间戳，未导出为 NULL |
 | tag | TEXT | 标注（悬浮窗标注功能：'urgent'/'star'/'idea'，NULL=无标注），悬浮窗整卡换色 + 主 App 日记页小色点共用 |
 | sync_uuid | TEXT | 云同步全局唯一身份（v14，跨端合并键；content+created_at 自然键在合并时辅助去重） |
-| is_locked | INTEGER | 笔记锁定标记（v15，0/1；用户手动锁定，主 App/悬浮窗/局域网服务全链路打码 + 设备凭据认证后可看。锁定状态随新插入行跨端传播，已有行不传播——合并只做新增并集） |
+| is_locked | INTEGER | 笔记锁定标记（v15，0/1；用户手动锁定，主 App/悬浮窗/局域网服务全链路打码 + 设备凭据认证后可看。锁定状态随新插入行跨端传播，已有行不传播——合并只做新增并集。2026-10-08 起加锁前置检查：设备未设锁屏密码（isDeviceSecure）时不允许锁定，弹引导跳系统安全设置页，详见 @floating-window.md「笔记锁定」小节） |
+| sort_order | INTEGER | 活跃区自定义排序键（v16，越小越靠前；**仅活跃区有意义，归档区行恒 NULL**——归档即清空、恢复归档回顶部）。悬浮窗长按拖动排序写入（`reorderActiveDiaries`），主 App 日记页/电脑访问服务读取同一 SQL 自动跟随。getDiaries 排序：`is_archived ASC, (sort_order IS NULL) ASC, sort_order ASC, created_at DESC`——活跃区漏网 NULL 行排活跃区尾部按时间倒序兜底（不错乱，首次重排即规范化）；归档区全 NULL 走 created_at DESC（现状不变）。新插入/恢复归档 = min-1 置顶；撤销删除恢复原值回原位置 |
 
 ### dismissed_splits 表（日记页 ✕ 学习，v9 新增）
 存储用户在日记页物品转存横条上 ✕ 掉的内容（同一 content UNIQUE，避免重复入库）。
@@ -75,7 +76,9 @@
 - `updateDiaryTag(id, tag)` - 更新日记标注（'urgent'/'star'/'idea'，null=取消标注；悬浮窗标注行调用）
 - `setDiaryLocked(id, locked)` - 设置/解除笔记锁定（v15；主 App DiaryTab 与悬浮窗 OverlayHome 的锁按钮共用）
 - `deleteDiary(id)` - 删除日记
-- `archiveDiary(id)` - 归档日记
+- `archiveDiary(id)` - 归档日记（顺带清 sort_order，归档区不参与排序）
+- `restoreDeletedDiary(row)` - 滑动删除撤销：全字段原样插回（sort_order 恢复原值回原位置，墓碑清除）
+- `reorderActiveDiaries(orderedActiveIds)` - 活跃区重排（v16；悬浮窗长按拖动排序的唯一写入入口）：事务内把活跃区 sort_order 规范重写为 0..n-1（按传入顺序），漏网活跃行（如重排期间新增）按 created_at DESC 续排尾部，归档行恒不动；写完 bump 云同步数据版本（DiarySyncBridge.bump 由调用方做）
 
 #### 导出相关
 - `markDiaryExported(id)` - 标记日记已导出
@@ -118,3 +121,4 @@
 | v12 → v13 | 新增 correction_pair_contexts 表 | 修正对语境档案（左右邻接字符，提示前语境门控） |
 | v13 → v14 | 云同步基础列 | diary/items 加 `sync_uuid` + sync_deleted 墓碑表（见 @docs/architecture/cloud-sync.md）。⚠️ 升级事务里只做 DDL，存量行 UUID 回填在首开成功后执行（幂等、失败下次启动/同步前重试）——回填的 Dart 循环拉长升级事务窗口是 2026-09-21 覆盖安装首启 database_closed 事故的诱因之一，配套修复：`DbHelper` 单飞打开（并发共享同一 Future）+ 瞬态打开失败重试（旧进程文件锁未完全释放时秒开会撞锁，真机复现杀后台重启自愈） |
 | v14 → v15 | diary 表添加 `is_locked` 字段 | 笔记锁定功能（防锁屏悬浮窗偷看）：用户手动锁定，主 App/悬浮窗/局域网服务全链路打码展示（固定星号 `＊＊＊＊＊＊`，不泄露长度），设备凭据认证（指纹优先/锁屏密码兜底）后 5 分钟会话内可见，锁屏立即重锁。存量行默认 0 无需回填 |
+| v15 → v16 | diary 表添加 `sort_order` 字段 | 悬浮窗长按拖动排序（详见 @docs/architecture/floating-window.md）。升级事务只做 DDL（v14 事故教训），存量活跃行回填在首开成功后执行（`_backfillSortOrder`，幂等）：⚠️ 迭代方向必须 created_at **ASC**——最旧行拿 min-1、最新行拿系列最小值，显示顺序与升级前（时间倒序）完全不变；按 DESC 迭代会把顺序整个颠倒（防再犯注释在 db_helper.dart）。配套 `_ensureSortOrderSchema`（PRAGMA 表结构自愈，版本号不可信场景兜底）。备份 CSV 追加第 8 列「排序」（放最后，旧 App 只读前几列天然兼容）；云同步 DiaryPayload 带 sortOrder 编解码宽容 |

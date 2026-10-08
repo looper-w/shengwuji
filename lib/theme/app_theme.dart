@@ -22,6 +22,9 @@ class AppThemeDefinition {
   /// 是否 Pro 付费主题（true 时未解锁点击会触发 ProUnlockDialog）
   final bool isPro;
 
+  /// ColorScheme 亮度（浅色主题恒 light；唯一的深色主题 [AppThemes.dark] 为 dark）
+  final Brightness brightness;
+
   /// 该主题的完整语义化色槽
   final AppThemeExtension extension;
 
@@ -30,6 +33,7 @@ class AppThemeDefinition {
     required this.name,
     required this.seedColor,
     this.isPro = false,
+    this.brightness = Brightness.light,
     required this.extension,
   });
 
@@ -37,7 +41,7 @@ class AppThemeDefinition {
   ThemeData toThemeData() {
     final colorScheme = ColorScheme.fromSeed(
       seedColor: seedColor,
-      brightness: Brightness.light,
+      brightness: brightness,
     );
 
     return ThemeData(
@@ -301,4 +305,71 @@ class AppThemes {
       isNeumorphic: true,
     ),
   );
+
+  /// 深色主题（全 App 唯一一套，2026-09-28 用户拍板）
+  ///
+  /// 定位：不是任何浅色主题的"深色变体"，而是深色模式下替换全部浅色主题的
+  /// 唯一深色皮肤——`MaterialApp.darkTheme` 专用，不进 [all]（主题选择器只
+  /// 选浅色皮肤，深浅切换由「深色模式」三档设置驱动，见 kThemeModePrefKey）。
+  ///
+  /// 配色按 Material 深色规范 + 品牌青保留（微信深色模式同款思路——关键按钮
+  /// 维持品牌色 + 白图标，不换成浅色主色 + 深图标）：
+  /// - 背景双层：scaffold #121212（规范基准面）/ 卡片 #1E1E1E（等效 elevation 1）
+  /// - primary 保持 #009688：白字对比度 3.3:1（大图标/粗体可用），深底上可见；
+  ///   primaryDark 反转为亮青 #80CBC4（语义是"强调文字色"，深底上深色文字不可读）
+  /// - primaryLight（选中背景）压暗为深青容器 #1E3A38
+  /// - 文字白 alpha 三档 87%/60%/38%（Material dark on-surface 规范）
+  /// - 语义色（warning 橙/danger 红/gold 金/fab 录音红）与浅色主题同款不随深浅变化
+  /// - 启动页沿用默认主题的深海渐变（本来就是深底，深浅两态视觉一致）
+  static const dark = AppThemeDefinition(
+    id: 'dark_standard',
+    name: '深色',
+    seedColor: Color(0xFF009688),
+    isPro: false,
+    brightness: Brightness.dark,
+    extension: AppThemeExtension(
+      primary: Color(0xFF009688),
+      primaryLight: Color(0xFF1E3A38),
+      primaryDark: Color(0xFF80CBC4),
+      surface: Color(0xFF1E1E1E),
+      cardBackground: Color(0xFF1E1E1E),
+      scaffoldBackground: Color(0xFF121212),
+      textPrimary: Color(0xDEFFFFFF),
+      textSecondary: Color(0x99FFFFFF),
+      textHint: Color(0x61FFFFFF),
+      textOnPrimary: Colors.white,
+      positiveAccent: Color(0xFF1B3A37),
+      positiveText: Color(0xFF80CBC4),
+      warningAccent: Color(0xFF3D2E1A),
+      warningText: Color(0xFFFFCC80),
+      dangerAccent: Color(0xFFEF5350),
+      timeHighlight: Color(0xFF90CAF9),
+      timeHighlightBg: Color(0xFF1A2E44),
+      splashBackground: Color(0xFF13253C),
+      splashGradient: [Color(0xFF0D1B2E), Color(0xFF13253C), Color(0xFF16304A)],
+      splashGlow: Color(0x5A5E9EDC),
+      goldAccent: Color(0xFFD4A437),
+      goldLight: Color(0xFFFFF8E7),
+      goldBorder: Color(0xFFE6C158),
+      fabReady: Color(0xFF009688),
+      fabRecording: Color(0xFFFF5252),
+      fabProcessing: Color(0xFFFFAB40),
+      fabDisabled: Colors.grey,
+      divider: Color(0x1FFFFFFF),
+      isDarkOverlay: true,
+    ),
+  );
 }
+
+/// 深色模式档位的 prefs key（string：'system' / 'light' / 'dark'）。
+/// 写入方：设置页外观区「深色模式」选择器；读取方：main() 启动预读。
+/// 悬浮窗是独立 engine 且固定浅色视觉（跨背景对比度设计，不做深色系），
+/// 不消费本 key。
+const kThemeModePrefKey = 'theme_mode';
+
+/// 解析深色模式档位：null/旧版本值/坏串一律兜底跟随系统
+ThemeMode parseThemeMode(String? raw) => switch (raw) {
+  'light' => ThemeMode.light,
+  'dark' => ThemeMode.dark,
+  _ => ThemeMode.system,
+};

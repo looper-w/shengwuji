@@ -275,7 +275,8 @@ class _AppPickerSheet extends StatefulWidget {
   State<_AppPickerSheet> createState() => _AppPickerSheetState();
 }
 
-class _AppPickerSheetState extends State<_AppPickerSheet> {
+class _AppPickerSheetState extends State<_AppPickerSheet>
+    with WidgetsBindingObserver {
   static const _channel = MethodChannel('com.shengwuji.app/app');
 
   final TextEditingController _searchCtrl = TextEditingController();
@@ -287,13 +288,27 @@ class _AppPickerSheetState extends State<_AppPickerSheet> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadInstalledApps();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _searchCtrl.dispose();
     super.dispose();
+  }
+
+  // zcode: 首装首次查询应用列表时，MIUI 等 ROM 在 ROM 层弹「读取应用列表」权限弹窗并返回空
+  // （QUERY_ALL_PACKAGES 是 normal 权限装即授，但 ROM 二次管控；权限弹窗只压 app 到
+  // inactive，抽屉不销毁），授权回来不会重新 initState，故列表为空时趁 resumed 自动重查
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed &&
+        _apps != null &&
+        _apps!.isEmpty) {
+      _loadInstalledApps();
+    }
   }
 
   Future<void> _loadInstalledApps() async {
@@ -309,7 +324,12 @@ class _AppPickerSheetState extends State<_AppPickerSheet> {
           )
           .where((a) => a.packageName.isNotEmpty)
           .toList();
-      if (mounted) setState(() => _apps = apps);
+      if (mounted) {
+        setState(() {
+          _apps = apps;
+          _loadFailed = false;
+        });
+      }
     } catch (e) {
       print("⚠️ [_AppPickerSheet] 获取应用列表失败: $e");
       if (mounted) {
@@ -347,6 +367,38 @@ class _AppPickerSheetState extends State<_AppPickerSheet> {
       return a.appName.toLowerCase().contains(q) ||
           a.packageName.toLowerCase().contains(q);
     }).toList();
+  }
+
+  /// 空态三分支：查询失败可重试 / 查到 0 个（ROM 权限拦截的兜底，resumed 自动重查
+  /// 万一仍为空时给手动出口）可重试 / 有数据但搜索词过滤后无匹配
+  Widget _buildEmptyState(AppThemeExtension ext) {
+    final String message;
+    final bool showRetry;
+    if (_loadFailed) {
+      message = "获取应用列表失败，请重试";
+      showRetry = true;
+    } else if (_apps!.isEmpty) {
+      message = "未获取到应用列表";
+      showRetry = true;
+    } else {
+      message = "没有匹配的应用";
+      showRetry = false;
+    }
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(message, style: TextStyle(fontSize: 14, color: ext.textHint)),
+          if (showRetry) ...[
+            const SizedBox(height: 12),
+            TextButton(
+              onPressed: _loadInstalledApps,
+              child: const Text('重新加载'),
+            ),
+          ],
+        ],
+      ),
+    );
   }
 
   @override
@@ -402,12 +454,7 @@ class _AppPickerSheetState extends State<_AppPickerSheet> {
               child: _apps == null
                   ? const Center(child: CircularProgressIndicator())
                   : _filtered(_apps!).isEmpty
-                  ? Center(
-                      child: Text(
-                        _loadFailed ? "获取应用列表失败，请重试" : "没有匹配的应用",
-                        style: TextStyle(fontSize: 14, color: ext.textHint),
-                      ),
-                    )
+                  ? _buildEmptyState(ext)
                   : ListView.builder(
                       padding: const EdgeInsets.only(bottom: 20),
                       itemCount: _filtered(_apps!).length,

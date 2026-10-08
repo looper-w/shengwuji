@@ -97,7 +97,8 @@
 
 - **VolumeKeyAccessibilityService.kt** - 无障碍服务，统一手势状态机（`onKeyEvent`）
   - **入口**：读该键的长按+双击两个槽位动作，都为 `none` → `return false`（音量键完全还给系统，等价旧 mode=off）
-  - **ACTION_DOWN**：取消 pendingSingleClick；长按槽有动作才缓存 `currentLongPressAction` + 启动长按计时（`longPressHandler.postDelayed`，时长读 prefs 档位，默认 400ms）。长按槽=none 时不启动计时——按住不放无动作，抬起走调音量路径
+  - **ACTION_DOWN**：取消 pendingSingleClick；长按槽有动作才缓存 `currentLongPressAction` + 启动长按计时（`longPressHandler.postDelayed`，时长读 prefs 档位，默认 400ms）。长按槽=none 时不启动计时——**按住不放由「按住连调」接管**（见下）；框架 repeat DOWN 事件直接吞掉（自排驱动，不依赖 ROM 是否派发重复事件）
+  - **按住连续调音量接管（2026-09-28）**：双击槽占用整键后，系统原生「按住音量键连调」必然失效——原生连调依赖系统收到未消费的 DOWN 事件流，而双击检测必须消费整键（第一次单击延迟 300ms 确认无第二击），这是结构性冲突无法「释放」。故在**长按槽=无动作**时由服务代为还原：DOWN 排定 500ms 初始延迟（对齐原生 repeat 起始），到期按 100ms/步重复 `adjustVolume`；UP 撤销计时，已连调过的按压跳过单击/双击状态机（防抬起被当第一次单击白跳一格）。用 Handler 自排而非依赖 repeat 事件（三星 ROM 不发送重复事件，longPressHandler 同款考量）。长按槽有动作时按住归手势不接管；录音中+单击停录开启时不接管
   - **ACTION_UP**：移除长按计时 → `wasLongPress` 短路（长按已处理，不再进双击）→ 双击槽有动作走 300ms 同键双击检测（第二次抬起时执行 `executeGestureAction`；录音中与非录音态同一套，2026-09-15 前录音中会短路直接调音量、导致双击停录失效）；双击槽无动作则**立即调音量**（不配双击的键单击没有 300ms 延迟，本次重构的体验优化）
   - **`executeGestureAction(action, source)`**：4 槽位动作的唯一分发入口（`when` → `triggerQuickRecord` / `triggerQuickTextNote` / `triggerShowOverlay` / `triggerVoiceMemoOverlay`）；`source`（「长按」/「双击」/「外部快捷方式」默认值）只进分发入口日志定位触发来源，trigger* 内部日志不再硬编码手势名
   - **`getGestureAction(prefs, newKey, migrate)`**：新 key 合法直接用，否则 Kotlin 侧内置迁移 fallback
@@ -248,6 +249,8 @@
 
 ## Changelog
 
+- 2026-09-28：新增「按住连续调音量」接管（用户反馈：双击槽位占用后，抖音/B站/微信里按住音量键无法连调音量）——根因是双击检测必须消费整键导致系统原生连调收不到事件流（结构性冲突无法「释放」，把 DOWN 还给系统则双击变成音量先跳两格+还触发动作）；长按槽=无动作时由服务代为还原：DOWN 排定 500ms 初始延迟后按 100ms/步重复 adjustVolume，UP 撤销且已连调的按压跳过单击/双击状态机（防抬起白跳一格+污染双击计时）；Handler 自排不依赖 ROM 是否派发 repeat 事件（三星不发，longPressHandler 同款考量）；长按槽有动作/录音中+单击停录开启时不接管；onInterrupt 补对称清理；compileDebugKotlin 通过
+- 2026-09-28：新增「无障碍保活指南」三级页——音量键快捷操作二级页顶部常驻入口「音量键没反应？看这里」（无论服务当前开关状态都展示：此刻开着 ≠ 明天不被系统杀掉）；三级页 `lib/settings/accessibility_keepalive_page.dart` 纯说明无状态：原因解释（国产 ROM 省电策略杀后台顺带关无障碍）+ 六项自查清单（自启动 / 最近任务锁定 / 电池无限制+允许后台活动 / 后台弹出界面 / 锁屏显示 / 重开无障碍服务）+ 兜底建议（搜索引擎查「无障碍服务 保活 + 手机品牌」）+ 底部按钮直达系统无障碍设置（复用 openAccessibilitySettings）；步骤不做深链跳转——各家 ROM 路径差异大，跳不准反而误导；新增 accessibility_keepalive_page_test 2 例（六步渲染契约 + 按钮可点，视口拉高防 ListView 懒构建漏渲染下半屏）
 - 2026-09-23（实验分支）：长按触发阈值新增「自定义」档——预设 200/300/400/700 之外可输入 [50,2000]ms 任意值（用户反馈「最短 200 仍太长」）；点自定义 chip 弹输入对话框，确认按钮在输入合法前禁用（「选中自定义就必须有值」由构造保证，取消/清空不落盘），再点已选中的自定义 chip 可重新编辑预填当前值，输入值恰为某预设时 UI 归位到该预设 chip；合法域从预设集合白名单放开为范围闭区间，Kotlin `getLongPressDurationMs` 同步改范围校验（`LONG_PRESS_MS_CHOICES` 集合删除，`LONG_PRESS_MS_MIN/MAX` 边界为新的跨端硬编码副本对，预设集合只剩 Dart 侧 chip 展示用途），旧档位 500/800/1200 落在范围内改为按原值继续生效（不再就近回落 400，尊重老用户当年显式选择）；行标题秒数显示非整百值改两位小数（如 0.15 秒，一位小数会误显 0.1）；值 <100ms（刻意单击的最短按压）时选择器下显警示文案：该键单击调音量/同键双击/按音量减保持静音/单击停录路径失效、每次按下直接触发长按动作（按住说话反而是受益者），均为「手势被挤掉」而非误触发，无需自动关任何开关；flutter analyze 0 error + flutter test 全过（normalize 组重写：自定义边界/旧档位存续/越界回落 + isCustom 5 例）
 - 2026-09-21（实验分支）：新增第 7 动作 `ptt_record`「按住说话」（长按槽位专属，Pro 门禁同语音速记）——按住达阈值开录、松开同一键停录转写；后端复用悬浮窗语音速记全链路，Kotlin 新增 PTT 会话跟踪（pttHoldActive/pttHoldKeyCode/pttReleasePending：UP 只认发起键 + 松手两条竞态兜底：冷启动取消挂起启动 / 开录回执到达补发停录），startVoiceMemo 负载新增 ptt key（Dart isPttSession 快照切停止提示「松开音量键」）；短按不受影响（阈值未到回落双击/调音量），与其他槽位动作天然共存；设置页 chip 仅长按两行提供
 - 2026-09-21：长按触发档位按用户实测反馈整体下调（400/500/800/1200 → **200/300/400/700ms**，默认 500 → 400）——旧最短档 400ms 体感仍偏钝（比 1.1.0~1.2.0 硬编码 500ms 时代的体感无实质差异），重度使用者宁愿改用双击；下限 200ms 用误触风险换响应速度（用户要求，刻意单击约 100~300ms 会误判，设置页副文案保留提示）；旧默认 500 不在新集合内，缺失/脏值/旧值统一就近回落 400（Dart normalize 与 Kotlin getLongPressDurationMs 同规则，老用户升级自动迁移无需显式迁移代码）；设置页 chips 改「很快0.2/快0.3/标准0.4/慢0.7」

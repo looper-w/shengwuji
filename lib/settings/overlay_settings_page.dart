@@ -9,7 +9,8 @@ import 'settings_widgets.dart';
 
 /// 「悬浮窗设置」二级页（zcode: 2026-09 设置页下沉——原主页「悬浮窗」分组整体
 /// 搬入：自动隐藏时长 / 停靠侧 / 贴边竖线两开关；2026-09-22 增「把手大小」
-/// 三档。prefs key 与 overlay engine、原生窗口 Gravity 等读取方全部不变；
+/// 三档；2026-09-27 增「字体大小」五档；2026-10-06 增「面板高度」可见条数
+/// 五档。prefs key 与 overlay engine、原生窗口 Gravity 等读取方全部不变；
 /// 悬浮窗配置同走 Pro 门禁（原 _ensureOverlayPro 语义，改用共享
 /// ProGate.tryAccess 实现））
 class OverlaySettingsPage extends StatefulWidget {
@@ -21,12 +22,21 @@ class OverlaySettingsPage extends StatefulWidget {
 
 class _OverlaySettingsPageState extends State<OverlaySettingsPage> {
   bool _isProUnlocked = false;
-  int _autoHideSeconds = OverlayConstants.autoHideDefaultSeconds; // 5/10/30 或 autoHideNeverSeconds=永久
+  int _autoHideSeconds = OverlayConstants
+      .autoHideDefaultSeconds; // 5/10/30 或 autoHideNeverSeconds=永久
   bool _edgeLineEnabled = true; // 自动隐藏后保留贴边竖线，默认开
   bool _edgeLineTapEnabled = true; // 点按贴边竖线回把手，默认开
   bool _overlaySideLeft = false; // 停靠侧：false=右缘/true=左缘，默认右缘
-  int _handleSizePercent = OverlayConstants.handleSizeDefaultPercent; // 把手大小档位 100/75/50
+  int _handleSizePercent =
+      OverlayConstants.handleSizeDefaultPercent; // 把手大小档位 100/75/50
   HandleTheme _handleTheme = HandleTheme.duo; // 把手主题：双色药丸/蓝紫/拟物胶囊
+  int _fontSizeStep =
+      OverlayConstants.fontSizeStepDefault; // 字体大小档位 -2~+2（每档 1pt）
+  int _panelMaxCards =
+      OverlayConstants.panelMaxCardsDefault; // 面板高度（可见条数档位 6~10）
+  bool _swipeDeleteEnabled = false; // 滑动直接删除笔记（替代滑动归档），默认关
+  int _edgeLineMarginDp =
+      OverlayConstants.edgeLineMarginDefault; // 竖线距屏幕边缘间距档位 0/8/16
 
   @override
   void initState() {
@@ -69,6 +79,24 @@ class _OverlaySettingsPageState extends State<OverlaySettingsPage> {
         // 把手主题（读取方：同上，坏串兜底双色药丸）
         _handleTheme = OverlayConstants.parseHandleTheme(
           prefs.getString(OverlayConstants.handleThemePrefKey),
+        );
+        // 字体大小档位（读取方：同上，clamp 到 -2~+2 兜底标准档）
+        _fontSizeStep = OverlayConstants.parseFontSizeStep(
+          prefs.getInt(OverlayConstants.fontSizeStepPrefKey),
+        );
+        // 滑动直接删除开关（读取方：overlay engine 的 _onCardSwipeDismissed——
+        // 动作型开关，划走回调里现场 reload 读，即时生效；默认关=划走归档）
+        _swipeDeleteEnabled =
+            prefs.getBool(OverlayConstants.swipeDeletePrefKey) ?? false;
+        // 竖线距屏幕边缘间距档位（读取方：overlay engine 的
+        // _refreshOverlayConfig/_scheduleAutoHide，非法值兜底贴边 0）
+        _edgeLineMarginDp = OverlayConstants.parseEdgeLineMargin(
+          prefs.getInt(OverlayConstants.edgeLineMarginPrefKey),
+        );
+        // 面板高度（可见条数档位，读取方：同上 + _buildPanel 的列表限高与
+        // 顶部下压偏移，clamp 到 6~10 兜底默认 10）
+        _panelMaxCards = OverlayConstants.parsePanelMaxCards(
+          prefs.getInt(OverlayConstants.panelMaxCardsPrefKey),
         );
       });
     }
@@ -129,8 +157,50 @@ class _OverlaySettingsPageState extends State<OverlaySettingsPage> {
     print('🔧 [Settings] overlay_handle_theme=${theme.name}');
   }
 
-  /// 悬浮窗配置的 Pro 门禁：已解锁返回 true 放行；未解锁弹付费弹窗并返回
-  /// false（调用方不写 prefs）。弹窗关闭后重读解锁状态刷新 Pro 徽章
+  /// 保存「字体大小」档位（读取方：overlay engine 的
+  /// _refreshOverlayConfig/_scheduleAutoHide——日记面板全部文字基准 ±1pt/档；
+  /// 生效时机同把手大小，已显示中的面板不瞬变）
+  Future<void> _saveFontSizeStep(int step) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(OverlayConstants.fontSizeStepPrefKey, step);
+    setState(() => _fontSizeStep = step);
+    print('🔧 [Settings] overlay_font_size_step=$step');
+  }
+
+  /// 保存「滑动直接删除」开关（读取方：overlay engine 的 _onCardSwipeDismissed——
+  /// 动作型开关，划走回调里现场 reload 读，即时生效无需等状态转换。开启后活跃
+  /// 卡划走直接删除（面板顶部撤销胶囊 3 秒内可撤销）；归档入口由卡片顶端
+  /// 勾选框保留）
+  Future<void> _saveSwipeDeleteEnabled(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(OverlayConstants.swipeDeletePrefKey, enabled);
+    setState(() => _swipeDeleteEnabled = enabled);
+    print('🔧 [Settings] overlay_swipe_delete_enabled=$enabled');
+  }
+
+  /// 保存「竖线距屏幕边缘间距」档位（读取方：overlay engine 的
+  /// _refreshOverlayConfig/_scheduleAutoHide——竖线视觉向屏内侧偏移，窗口与
+  /// 触摸缓冲区不动。生效时机同把手大小：悬浮窗下一次状态转换）
+  Future<void> _saveEdgeLineMargin(int marginDp) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(OverlayConstants.edgeLineMarginPrefKey, marginDp);
+    setState(() => _edgeLineMarginDp = marginDp);
+    print('🔧 [Settings] overlay_edge_line_margin_dp=$marginDp');
+  }
+
+  /// 保存「面板高度」可见条数档位（读取方：overlay engine 的
+  /// _refreshOverlayConfig/_scheduleAutoHide + _buildPanel——列表限高
+  /// panelListMaxHeightFor + 顶部下压偏移 panelTopOffsetFor；条数越少顶部
+  /// 按钮组越下移（每少 1 条下压一张卡高），整列底边位置不变。生效时机
+  /// 同把手大小：悬浮窗下一次状态转换）
+  Future<void> _savePanelMaxCards(int cards) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(OverlayConstants.panelMaxCardsPrefKey, cards);
+    setState(() => _panelMaxCards = cards);
+    print('🔧 [Settings] overlay_panel_max_cards=$cards');
+  }
+
+  /// 悬浮窗配置的 Pro 门禁：已解锁返回 true 放行；未解锁弹付费弹窗并返回  /// false（调用方不写 prefs）。弹窗关闭后重读解锁状态刷新 Pro 徽章
   /// （原 settings_tab._ensureOverlayPro 语义，改用 ProGate 实现）
   Future<bool> _ensureOverlayPro() async {
     final ok = await ProGate.tryAccess(context);
@@ -206,6 +276,14 @@ class _OverlaySettingsPageState extends State<OverlaySettingsPage> {
           SettingsCard(child: _buildHandleThemeSelector()),
           const SizedBox(height: 24),
 
+          const SettingsSectionTitle("字体大小"),
+          SettingsCard(child: _buildFontSizeSelector()),
+          const SizedBox(height: 24),
+
+          const SettingsSectionTitle("面板高度"),
+          SettingsCard(child: _buildPanelHeightSelector()),
+          const SizedBox(height: 24),
+
           const SettingsSectionTitle("收起后自动隐藏"),
           SettingsCard(child: _buildAutoHideSelector()),
           const SizedBox(height: 24),
@@ -238,10 +316,7 @@ class _OverlaySettingsPageState extends State<OverlaySettingsPage> {
                 // 线态点按开关（读取方：overlay engine 的 _onEdgeLineTap）
                 buildSettingsSwitchTile(
                   context,
-                  title: const Text(
-                    '点按竖线展开把手',
-                    style: TextStyle(fontSize: 13),
-                  ),
+                  title: const Text('点按竖线展开把手', style: TextStyle(fontSize: 13)),
                   subtitle: Text(
                     '开启后点按贴边竖线回到把手，再点把手展开面板；关闭后点按无反应，仅朝屏幕内侧滑动或音量键可展开',
                     style: TextStyle(fontSize: 11, color: ext.textHint),
@@ -253,7 +328,28 @@ class _OverlaySettingsPageState extends State<OverlaySettingsPage> {
                     _saveEdgeLineTapEnabled(v);
                   },
                 ),
+                const SizedBox(height: 8),
+                _buildEdgeLineMarginSelector(),
               ],
+            ),
+          ),
+          const SizedBox(height: 24),
+
+          const SettingsSectionTitle("滑动操作"),
+          SettingsCard(
+            child: buildSettingsSwitchTile(
+              context,
+              title: const Text('滑动直接删除笔记', style: TextStyle(fontSize: 13)),
+              subtitle: Text(
+                '开启后活跃卡片朝屏幕内侧滑动直接删除（面板顶部提示 3 秒内可撤销）；归档仍可点卡片顶端圆圈。关闭则维持默认：滑动=归档',
+                style: TextStyle(fontSize: 11, color: ext.textHint),
+              ),
+              value: _swipeDeleteEnabled,
+              onChanged: (v) async {
+                // 悬浮窗配置同走 Pro 门禁（与其他配置一致），未解锁不写 prefs
+                if (!await _ensureOverlayPro()) return;
+                _saveSwipeDeleteEnabled(v);
+              },
             ),
           ),
         ],
@@ -326,17 +422,108 @@ class _OverlaySettingsPageState extends State<OverlaySettingsPage> {
     );
   }
 
+  // --- 悬浮窗「字体大小」五档选择器：特小/小/标准/大/特大，档位值 -2~+2，
+  // 每档 1pt（基准即当前字号；档差 0.5pt 真机不可辨、2pt 会让最小档跌破可读
+  // 下限，故取 1pt）。只作用日记面板文字；把手（有独立大小档位）与语音速记
+  // 胶囊（宽度预算按 15 号字调过）不缩放。生效时机同把手大小——下一次
+  // 展开/收起状态转换
+  Widget _buildFontSizeSelector() {
+    final ext = AppThemeExtension.of(context);
+    final options = [(-2, '特小'), (-1, '小'), (0, '标准'), (1, '大'), (2, '特大')];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          spacing: 8,
+          runSpacing: 6,
+          children: options.map((opt) {
+            final (step, label) = opt;
+            final selected = _fontSizeStep == step;
+            return ChoiceChip(
+              // Aa 图标大小随档位递减/递增：图标本身暗示字号档位
+              avatar: Icon(
+                Icons.format_size,
+                size: 14.0 + step * 2,
+                color: selected ? ext.textOnPrimary : ext.primary,
+              ),
+              label: Text(label),
+              selected: selected,
+              selectedColor: ext.primary,
+              labelStyle: TextStyle(
+                color: selected ? ext.textOnPrimary : ext.textPrimary,
+                fontSize: 13,
+              ),
+              onSelected: (_) async {
+                // 字体大小属于悬浮窗配置，同走 Pro 门禁（未解锁不写 prefs）
+                if (!await _ensureOverlayPro()) return;
+                _saveFontSizeStep(step);
+              },
+            );
+          }).toList(),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          '缩放随手记面板的文字大小（每档 ±1pt，不影响把手与录音胶囊）。改动在悬浮窗下一次展开/收起后生效',
+          style: TextStyle(fontSize: 11, color: ext.textHint),
+        ),
+      ],
+    );
+  }
+
+  // --- 悬浮窗「面板高度」可见条数选择器（2026-10-06，用户需求：大屏手机单手
+  // 拿时面板顶部的新建/展开按钮够不着）：10 条（默认，历史行为）~6 条五档。
+  // 条数越少，面板顶部按钮组随之下移（每少 1 条下压一张卡高），满列表时整列
+  // 底边位置不变——单手大拇指可轻松按到顶部按钮。单位用条数（比高/中/低
+  // 档位直观）。生效时机同把手大小——下一次展开/收起状态转换
+  Widget _buildPanelHeightSelector() {
+    final ext = AppThemeExtension.of(context);
+    final options = [10, 9, 8, 7, 6];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          spacing: 8,
+          runSpacing: 6,
+          children: options.map((cards) {
+            final selected = _panelMaxCards == cards;
+            return ChoiceChip(
+              // 列表图标大小随条数递减：图标本身暗示面板高度档位
+              avatar: Icon(
+                Icons.view_agenda_outlined,
+                size: 8.0 + cards,
+                color: selected ? ext.textOnPrimary : ext.primary,
+              ),
+              label: Text('$cards 条'),
+              selected: selected,
+              selectedColor: ext.primary,
+              labelStyle: TextStyle(
+                color: selected ? ext.textOnPrimary : ext.textPrimary,
+                fontSize: 13,
+              ),
+              onSelected: (_) async {
+                // 面板高度属于悬浮窗配置，同走 Pro 门禁（未解锁不写 prefs）
+                if (!await _ensureOverlayPro()) return;
+                _savePanelMaxCards(cards);
+              },
+            );
+          }).toList(),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          '降低面板一次可见的笔记条数，面板顶部（新建/展开按钮）随之下移、底部位置不变，单手更好按。改动在悬浮窗下一次展开/收起后生效',
+          style: TextStyle(fontSize: 11, color: ext.textHint),
+        ),
+      ],
+    );
+  }
+
   // --- 悬浮窗「把手大小」三档选择器（2026-09-22，用户反馈把手胶囊有点大）：
   // 标准（100%，历史视觉）/ 小（75%）/ 迷你（50%，胶囊 12×40 放不下竖排文字，
   // 只渲染闪电图标）。只缩视觉不缩窗口（触控面积不变），竖线高度跟随档位等比
   // 缩、宽 4dp 不缩；生效时机同停靠侧——悬浮窗下一次展开/收起状态转换
   Widget _buildHandleSizeSelector() {
     final ext = AppThemeExtension.of(context);
-    final options = [
-      (100, '标准', 16.0),
-      (75, '小', 12.0),
-      (50, '迷你', 8.0),
-    ];
+    final options = [(100, '标准', 16.0), (75, '小', 12.0), (50, '迷你', 8.0)];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -453,6 +640,55 @@ class _OverlaySettingsPageState extends State<OverlaySettingsPage> {
           },
         );
       }).toList(),
+    );
+  }
+
+  // --- 竖线「距屏幕边缘间距」三档选择器（2026-09-29，用户反馈：贴带黑边的
+  // 钢化膜后贴边竖线可能被遮住）：贴边（0，历史行为）/ 内移（4）/ 最里（8）。
+  // 只内移竖线视觉，窗口与触摸缓冲区不动；
+  // 生效时机同把手大小——悬浮窗下一次状态转换
+  Widget _buildEdgeLineMarginSelector() {
+    final ext = AppThemeExtension.of(context);
+    final options = [(0, '贴边'), (4, '内移'), (8, '最里')];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('距屏幕边缘间距', style: TextStyle(fontSize: 13, color: ext.textPrimary)),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 8,
+          runSpacing: 6,
+          children: options.map((opt) {
+            final (margin, label) = opt;
+            final selected = _edgeLineMarginDp == margin;
+            return ChoiceChip(
+              // 竖条图标离左边框的间距随档位拉宽：图标本身暗示边距档位
+              avatar: Icon(
+                Icons.vertical_align_center,
+                size: 12.0 + margin / 2,
+                color: selected ? ext.textOnPrimary : ext.primary,
+              ),
+              label: Text(label),
+              selected: selected,
+              selectedColor: ext.primary,
+              labelStyle: TextStyle(
+                color: selected ? ext.textOnPrimary : ext.textPrimary,
+                fontSize: 13,
+              ),
+              onSelected: (_) async {
+                // 竖线间距属于悬浮窗配置，同走 Pro 门禁（未解锁不写 prefs）
+                if (!await _ensureOverlayPro()) return;
+                _saveEdgeLineMargin(margin);
+              },
+            );
+          }).toList(),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          '贴了带黑边的钢化膜、竖线被膜边遮住时调大；只移动竖线视觉位置，触控区域不变。改动在悬浮窗下一次展开/收起后生效',
+          style: TextStyle(fontSize: 11, color: ext.textHint),
+        ),
+      ],
     );
   }
 }

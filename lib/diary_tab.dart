@@ -38,8 +38,12 @@ import 'package:file_picker/file_picker.dart';
 import '../app_logger.dart';
 import 'package:persistent_user_dir_access_android/persistent_user_dir_access_android.dart';
 import '../utils/query_detector.dart';
+import '../utils/big_bang_search.dart'; // 大爆炸层联网搜索配置
+import '../utils/recognition_activity.dart';
 import '../utils/item_splitter.dart';
 import '../utils/correction_learner.dart';
+import '../overlay/widgets/big_bang_layer.dart'; // 大爆炸分词层（悬浮窗同款）
+import '../overlay/overlay_constants.dart'; // 大爆炸层顶边参照（悬浮窗 8 条档位同源）
 import 'correction/context_corrector.dart';
 import 'correction/pair_context.dart';
 import '../utils/diary_tag.dart';
@@ -269,6 +273,12 @@ class DiaryTabState extends State<DiaryTab> with WidgetsBindingObserver {
   Timer? _searchDebounce;
   static const Duration _searchDebounceDelay = Duration(milliseconds: 250);
 
+  // --- 标注筛选（❗紧急/⭐收藏/💡灵感，单选；null=全部） ---
+  // 与搜索关键词在 SQL 层叠加（AND）；筛选行默认收起，由搜索框旁的
+  // 筛选图标按钮展开/收起（页面零新增常驻元素，图标小圆点提示筛选生效中）
+  String? _tagFilter;
+  bool _tagFilterExpanded = false;
+
   // --- 编辑相关变量 ---
   final TextEditingController _editController =
       TextEditingController(); // 编辑控制器（底部抽屉复用）
@@ -298,7 +308,7 @@ class DiaryTabState extends State<DiaryTab> with WidgetsBindingObserver {
   /// 智能识别开关（默认开启，用户可在设置页关闭）
   bool _itemTransferEnabled = true; // 日记智能识别物品+位置 → 显示转存横条
   bool _queryAnswerEnabled = true; // 日记智能查询"XX在哪儿" → 显示答案区
-  bool _swapTapLongPress = false; // 日记卡片单击/长按交换开关（默认关闭=单击复制/长按编辑）
+  bool _swapTapLongPress = false; // 日记卡片单击/双击交换开关（默认关闭=单击复制/双击编辑；长按恒为大爆炸分词。prefs key 是历史名 diary_card_swap_tap_longpress，不可改）
 
   // ── 笔记锁定（diary.is_locked）──
   // 解锁会话快照（NoteUnlockSession 的本页缓存）：true 时锁定卡显示明文。
@@ -836,7 +846,16 @@ class DiaryTabState extends State<DiaryTab> with WidgetsBindingObserver {
 
     // 只同步状态（如果单例已初始化）
     if (_recognizerManager.hasEverInitialized) {
-      await initEngine();
+      // 两种情况转后台并行预热、不阻塞调用方（main.dart 快速录音 await
+      // refreshEngine 后立刻 startListening，模型冷加载由说话时间盖住，
+      // stopListening 阶段4 转写前还有 await 兜底）：
+      // 1. 退后台释放后（main.dart _backgroundReleaseGuard）worker 已销毁
+      //    但 hasEverInitialized 不回退 → isReady=false；
+      // 2. 热切换待加载：导入新模型后 worker 还在服务旧路径（isReady=true
+      //    但 isServingLatestModel=false），必须放行 initEngine 加载新模型
+      if (!_recognizerManager.isReady || !_recognizerManager.isServingLatestModel) {
+        unawaited(initEngine());
+      }
       return;
     }
 
@@ -918,12 +937,48 @@ class DiaryTabState extends State<DiaryTab> with WidgetsBindingObserver {
       }
       await widget.dbHelper.setDiaryLocked(id, false);
     } else {
+      // 加锁前置检查：设备未设锁屏密码（PIN/图案/密码）时不允许锁定——
+      // 锁定后没有任何认证手段能看回内容，锁定形同虚设反而误导用户以为
+      // 已保护。弹引导对话框（可选跳系统安全设置页），本次不加锁
+      if (!await NoteLockAuth.isDeviceSecure()) {
+        if (!mounted) return;
+        await _showNoScreenLockDialog();
+        return;
+      }
       await widget.dbHelper.setDiaryLocked(id, true);
       await NoteUnlockSession.revoke();
       _notesUnlocked = false;
     }
     DiarySyncBridge.bump(); // 悬浮窗感知锁定标志变化（跨 engine 计数桥）
     refreshList();
+  }
+
+  /// 加锁前置检查未通过的引导弹窗：设备未设置锁屏密码 → 提示先去系统
+  /// 设置里设锁屏密码（「去设置」拉起系统安全设置页），本笔记不加锁
+  Future<void> _showNoScreenLockDialog() async {
+    if (!mounted) return;
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("未设置锁屏密码"),
+        content: const Text(
+          "锁定笔记需要先用锁屏密码（或指纹）保护手机，否则锁定后无法验证身份。\n\n请先在系统设置中设置锁屏密码，再回来锁定。",
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text("取消"),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text("去设置"),
+          ),
+        ],
+      ),
+    );
+    if (go == true) {
+      await NoteLockAuth.openSecuritySettings();
+    }
   }
 
   /// 重新查库并刷新列表。
@@ -939,6 +994,7 @@ class DiaryTabState extends State<DiaryTab> with WidgetsBindingObserver {
     _notesUnlocked = await NoteUnlockSession.isUnlocked();
     final data = await widget.dbHelper.getDiaries(
       keyword: _searchController.text,
+      tag: _tagFilter,
     );
 
     if (mounted) {
@@ -1733,6 +1789,33 @@ $content
         });
       }
     });
+
+    // 懒启动识别 worker（照抄悬浮窗 overlay_voice_memo.start：录音期间预热
+    // 模型，与录音并行）：
+    //  - preloadModelPath 解析模型目录（退后台释放后 _currentModelPath 被置空，
+    //    重新加载前必须重解析，见 recognizer_singleton.dispose）
+    //  - initialize 不 await（冷加载 1~1.5s 被说话时间盖住），失败只 log——
+    //    stopListening 阶段4 转写前还有一次 await 兜底
+    try {
+      await RecognizerSingleton.preloadModelPath();
+      unawaited(
+        RecognizerSingleton.instance
+            .initialize()
+            .then((ok) {
+              log(
+                ok
+                    ? '✅ [Diary] 识别 worker 已就绪(录音期间并行预热)'
+                    : '⚠️ [Diary] 识别 worker 预热失败(停止转写时再兜底)',
+              );
+            })
+            .catchError((Object e) {
+              log('⚠️ [Diary] 识别 worker 预热异常(停止转写时再兜底): $e');
+            }),
+      );
+    } catch (e) {
+      // 路径解析失败不阻塞录音：转写阶段兜底 initialize 会再试一次
+      log("🔍 [Diary] 模型路径预加载失败(不中断录音): $e");
+    }
   }
 
   void stopListening() async {
@@ -1872,56 +1955,34 @@ $content
     await Future.delayed(const Duration(milliseconds: 100)); // 等 UI 渲染稳定
 
     // === 阶段4：加载模型（无遮罩；UI 可能短暂卡顿但动画已演完） ===
+    // ⚠️ 不能以 hasEverInitialized 短路加载：退后台释放（main.dart
+    // _backgroundReleaseGuard）后 worker 已销毁但该标志不回退，必须"未就绪
+    // 就重新加载"。原 hasEverInitialized=true 分支无失败处理，initEngine
+    // 失败会掉进下方 _engineReadyCompleter.future 永久挂起（completer 只在
+    // 加载成功时 complete）——统一走带失败处理的路径
     try {
       if (!isReady || !_recognizerManager.isReady) {
-        if (!_recognizerManager.hasEverInitialized) {
-          try {
-            await initEngine();
-            if (!isReady) {
-              // 加载失败处理
-              if (_isLockedRecording) {
-                _isLockedRecording = false;
-                try {
-                  await WakelockPlus.disable();
-                } catch (e) {
-                  log("禁用 Wakelock 失败: $e");
-                }
-              }
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text("⚠️ 模型加载失败，请检查设置")),
-                );
-              }
-              _updateState(() {
-                isProcessing = false;
-                statusText = "录音已停止";
-              });
-              return;
+        await initEngine();
+        if (!isReady) {
+          // 加载失败处理
+          if (_isLockedRecording) {
+            _isLockedRecording = false;
+            try {
+              await WakelockPlus.disable();
+            } catch (e) {
+              log("禁用 Wakelock 失败: $e");
             }
-          } catch (e) {
-            if (mounted) {
-              ScaffoldMessenger.of(
-                context,
-              ).showSnackBar(SnackBar(content: Text("⚠️ 模型加载出错: $e")));
-            }
-            if (_isLockedRecording) {
-              _isLockedRecording = false;
-              try {
-                await WakelockPlus.disable();
-              } catch (e) {
-                log("禁用 Wakelock 失败: $e");
-              }
-            }
-            _updateState(() {
-              isProcessing = false;
-              statusText = "录音已停止";
-            });
-            return;
           }
-        } else {
-          // hasEverInitialized 为 true 但 isReady 为 false
-          // 说明引擎已初始化但 DiaryTab 状态未同步（如快捷方式冷启动进入）
-          await initEngine();
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text("⚠️ 模型加载失败，请检查设置")),
+            );
+          }
+          _updateState(() {
+            isProcessing = false;
+            statusText = "录音已停止";
+          });
+          return;
         }
       }
 
@@ -1967,6 +2028,9 @@ $content
   // diaryId != null：占位已入库，识别成功后走 updateDiary 回填，失败/为空保留占位
   // diaryId == null：占位落盘失败兜底，走老的 insertDiary 路径
   Future<void> _processRecognition({int? diaryId}) async {
+    // 整场识别计数（覆盖 VAD 多段转写）：按流程而非逐段计数——逐段计数在
+    // 段间隙会归零，恰好撞上退后台释放轮询会丢掉后续段
+    RecognitionActivity.begin();
     try {
       final rawText = await _recognizeLong();
       if (rawText.isNotEmpty) {
@@ -1979,6 +2043,8 @@ $content
       log("日记识别出错: $e");
       AppLogger.appLog('❌ [Diary] 识别出错: $e');
     } finally {
+      // 与开头 begin 配对（转写抛错也回退，防计数泄漏导致引擎永不释放）
+      RecognitionActivity.end();
       // 清理缓冲区：识别路径（_recognizeLong）会自己管 stream.free，
       // 但 _audioBuffer 和 _pcmBuilder 是录音期间累积的，必须在这里清理
       _audioBuffer.clear();
@@ -2439,6 +2505,9 @@ $content
       }
     }
 
+    // 整场再转写计数（含 VAD 多段）：防退后台释放守卫在 decode 中途
+    // dispose worker（end 在下方 finally，抛错也回退）
+    RecognitionActivity.begin();
     _transcribingIds.add(id);
     if (mounted) {
       setState(() {}); // 卡片切到"正在转写…"态
@@ -2492,6 +2561,7 @@ $content
         ).showSnackBar(const SnackBar(content: Text('转写失败，录音已保留，可重试')));
       }
     } finally {
+      RecognitionActivity.end(); // 与开头 begin 配对（防计数泄漏导致永不释放）
       _transcribingIds.remove(id);
       if (mounted) {
         widget.onLoadingChanged?.call(false);
@@ -2699,6 +2769,49 @@ $content
     _haptic('tick');
     await Clipboard.setData(ClipboardData(text: content));
     // 静默复制，不显示提示
+  }
+
+  /// 长按卡片唤起大爆炸分词层（锤子 Big Bang 式，与悬浮窗展开卡同款交互，
+  /// 复用 overlay 的 BigBangLayer）：白底模态把正文炸成词块，点选/滑选
+  /// 后一键复制。主 engine 无悬浮窗的「面板高度」档位，层顶边按悬浮窗
+  /// 8 条档位的顶部高度取值（OverlayConstants.bigBangMainAppTopInset，
+  /// 用户拍板——比仅状态栏避让矮一截，单手够得着顶栏）；路由不透明=false
+  /// 让顶部留白透出下层日记页（压暗遮罩在层内自绘，对齐悬浮窗视觉）
+  void _openBigBang(String content) {
+    _haptic('tick');
+    Navigator.of(context).push(
+      PageRouteBuilder(
+        opaque: false,
+        transitionDuration: const Duration(milliseconds: 150),
+        pageBuilder: (context, _, _) => BigBangLayer(
+          text: content,
+          topInset: OverlayConstants.bigBangMainAppTopInset,
+          onClose: () => Navigator.of(context).pop(),
+          onCopy: (text) async {
+            _copyToClipboard(text); // 静默复制 + tick 震动（复用既有）
+            return true;
+          },
+          // 联网搜索选中词块：读搜索配置后经主 App 通道 openUrl 拉起浏览器
+          onSearch: (text) async {
+            final cfg = await loadSearchConfig();
+            try {
+              final ok = await _channel.invokeMethod<bool>('openUrl', {
+                'url': buildSearchUrl(cfg.engine, text),
+                'packageName': cfg.browserPackage,
+              });
+              return ok ?? false;
+            } catch (_) {
+              return false;
+            }
+          },
+          // 缺省 onHaptic 走悬浮窗无障碍通道，主 engine 未注册会抛
+          // MissingPluginException——必须注入主 App 自己的 _haptic
+          onHaptic: _haptic,
+        ),
+        transitionsBuilder: (context, anim, _, child) =>
+            FadeTransition(opacity: anim, child: child),
+      ),
+    );
   }
 
   /// 分享日记内容到 AI 应用
@@ -3151,7 +3264,7 @@ $content
       children: [
         // 日期 + 时长（移至卡片顶部，腾出底部按钮空间）
         Padding(
-          padding: const EdgeInsets.only(bottom: 6),
+          padding: const EdgeInsets.only(bottom: 4),
           child: Row(
             children: [
               // 标注小色点（tag 非空才渲染；归档卡也显示，标记不随归档消失）
@@ -3192,7 +3305,7 @@ $content
                   kLockedMaskText,
                   style: TextStyle(
                     fontSize: 16,
-                    height: 1.6,
+                    height: 1.5,
                     color: ext.textHint,
                     letterSpacing: 2,
                   ),
@@ -3241,7 +3354,7 @@ $content
             content,
             style: TextStyle(
               fontSize: 16,
-              height: 1.6,
+              height: 1.5,
               color: isArchived ? ext.textHint : ext.textPrimary,
               decoration: isArchived ? TextDecoration.lineThrough : null,
             ),
@@ -3252,7 +3365,7 @@ $content
             timeEntities: timeEntities,
             baseStyle: TextStyle(
               fontSize: 16,
-              height: 1.6,
+              height: 1.5,
               color: isArchived ? ext.textHint : ext.textPrimary,
               decoration: isArchived ? TextDecoration.lineThrough : null,
             ),
@@ -3280,7 +3393,7 @@ $content
               onDismiss: () => _onItemSplitDismiss(diaryId, content),
             ),
           ),
-        const SizedBox(height: 10),
+        const SizedBox(height: 6),
         // 底部按钮行：左 = 播放进度条（响度波纹叠加），右 = 重试/AI/心形三按钮
         // crossAxisAlignment.center 让按钮与进度条垂直居中对齐
         Row(
@@ -3440,7 +3553,7 @@ $content
 
     // 按钮颜色逻辑
     Color btnColor = ext.fabReady;
-    Widget btnChild = Icon(Icons.mic, color: ext.textOnPrimary, size: 40);
+    Widget btnChild = Icon(Icons.mic, color: ext.fabContentColor, size: 40);
     VoidCallback? onBtnPressed = startListening;
 
     // 获取当前屏幕的媒体查询数据
@@ -3452,7 +3565,7 @@ $content
     } else if (isListening) {
       // 正在录音状态：红色背景，停止方块图标
       btnColor = ext.fabRecording;
-      btnChild = Icon(Icons.stop, color: ext.textOnPrimary, size: 40);
+      btnChild = Icon(Icons.stop, color: ext.fabContentColor, size: 40);
     } else if (isProcessing) {
       // 识别中状态：橙色背景，显示转圈圈的 Loading
       btnColor = ext.fabProcessing;
@@ -3460,7 +3573,7 @@ $content
         width: 30,
         height: 30,
         child: CircularProgressIndicator(
-          color: ext.textOnPrimary,
+          color: ext.fabContentColor,
           strokeWidth: 3,
         ),
       );
@@ -3603,6 +3716,33 @@ $content
                             ),
                     ),
                     const SizedBox(width: 12),
+                    // 标注筛选按钮（展开/收起筛选行；筛选生效时右上角色点提示，
+                    // 色点颜色 = 当前筛中的标注色）
+                    IconButton(
+                      onPressed: () => _updateState(
+                        () => _tagFilterExpanded = !_tagFilterExpanded,
+                      ),
+                      icon: Badge(
+                        isLabelVisible: _tagFilter != null,
+                        smallSize: 8,
+                        backgroundColor:
+                            DiaryTag.colorOf(_tagFilter) ?? ext.primary,
+                        child: Icon(
+                          _tagFilterExpanded
+                              ? Icons.filter_alt_rounded
+                              : Icons.filter_alt_outlined,
+                        ),
+                      ),
+                      tooltip: '按标注筛选',
+                      style: IconButton.styleFrom(
+                        backgroundColor:
+                            (_tagFilterExpanded || _tagFilter != null)
+                            ? ext.primary.withValues(alpha: 0.18)
+                            : ext.primary.withValues(alpha: 0.1),
+                        foregroundColor: ext.primary,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
                     // 导出按钮（长按可重新选择目录）
                     IconButton(
                       onPressed: _exportDiariesToMarkdown,
@@ -3624,13 +3764,27 @@ $content
                   ],
                 ),
               ),
+              // 标注筛选行（默认收起，筛选图标按钮展开；收起时保留宽度占位
+              // 防 AnimatedSize 横向跳动）
+              AnimatedSize(
+                duration: const Duration(milliseconds: 200),
+                curve: Curves.easeOut,
+                alignment: Alignment.topCenter,
+                child: _tagFilterExpanded
+                    ? _buildTagFilterRow(ext)
+                    : const SizedBox(width: double.infinity),
+              ),
               const SizedBox(height: 10),
               // 日记列表
               Expanded(
                 child: _diaryList.isEmpty
                     ? Center(
                         child: Text(
-                          _isLoadingList ? "加载中..." : "还没有日记，试着说句话吧",
+                          _isLoadingList
+                              ? "加载中..."
+                              : _tagFilter != null
+                              ? "没有该标注的日记"
+                              : "还没有日记，试着说句话吧",
                           style: TextStyle(color: ext.textHint),
                         ),
                       )
@@ -3710,8 +3864,13 @@ $content
                                   }
                                 },
                                 child: GestureDetector(
-                                  // 占位日记 content=''：复制路径不处理空文本（编辑空笔记合法）
-                                  // _swapTapLongPress=true 时交换：单击=编辑、长按=复制
+                                  // 手势矩阵（2026-10-06 改版）：长按恒 = 大爆炸
+                                  // 分词层（悬浮窗展开卡同款）；单击/双击在
+                                  // 复制↔编辑之间由 _swapTapLongPress 交换
+                                  //（开关历史名「交换单击与长按」，长按让位大
+                                  // 爆炸后交换对象变为双击）
+                                  // 占位日记 content=''：复制/大爆炸不处理空文本
+                                  //（编辑空笔记合法）
                                   // 锁定打码卡三手势全部先过认证（内容级操作门禁）
                                   onTap: () {
                                     if (_isLockedHidden(item)) {
@@ -3735,16 +3894,6 @@ $content
                                       _ensureNoteUnlocked();
                                       return;
                                     }
-                                    final c = item['content'] as String;
-                                    if (c.trim().isNotEmpty) {
-                                      _shareToAI(c); // 新增：双击分享（不受交换开关影响）
-                                    }
-                                  },
-                                  onLongPress: () {
-                                    if (_isLockedHidden(item)) {
-                                      _ensureNoteUnlocked();
-                                      return;
-                                    }
                                     if (_swapTapLongPress) {
                                       final c = item['content'] as String;
                                       if (c.trim().isNotEmpty) {
@@ -3757,6 +3906,16 @@ $content
                                       );
                                     }
                                   },
+                                  onLongPress: () {
+                                    if (_isLockedHidden(item)) {
+                                      _ensureNoteUnlocked();
+                                      return;
+                                    }
+                                    final c = item['content'] as String;
+                                    if (c.trim().isNotEmpty) {
+                                      _openBigBang(c); // 不受交换开关影响
+                                    }
+                                  },
                                   // 新拟物主题：实底凸起卡片（无毛玻璃/描边）；
                                   // 其余主题保持 ClipRRect+BackdropFilter 玻璃拟态
                                   child: ext.isNeumorphic
@@ -3764,7 +3923,14 @@ $content
                                           margin: const EdgeInsets.only(
                                             bottom: 12,
                                           ),
-                                          padding: const EdgeInsets.all(16),
+                                          // 纵向 padding 收窄（上12/下8）提高整屏笔记密度，
+                                          // 横向 16 与按钮 40×40 命中区不动
+                                          padding: const EdgeInsets.fromLTRB(
+                                            16,
+                                            12,
+                                            16,
+                                            8,
+                                          ),
                                           decoration: neuRaisedDecoration(
                                             context,
                                             radius: 18,
@@ -3784,7 +3950,15 @@ $content
                                               margin: const EdgeInsets.only(
                                                 bottom: 12,
                                               ),
-                                              padding: const EdgeInsets.all(16),
+                                              // 纵向 padding 收窄（上12/下8）提高整屏
+                                              // 笔记密度，横向 16 不动
+                                              padding:
+                                                  const EdgeInsets.fromLTRB(
+                                                16,
+                                                12,
+                                                16,
+                                                8,
+                                              ),
                                               decoration: BoxDecoration(
                                                 color: ext.cardBackground
                                                     .withValues(alpha: 0.7),
@@ -3817,6 +3991,71 @@ $content
               ),
             ],
           ),
+        ],
+      ),
+    );
+  }
+
+  /// 标注筛选行（搜索框旁筛选图标展开后显示；单选，与搜索关键词叠加过滤）
+  Widget _buildTagFilterRow(AppThemeExtension ext) {
+    // (tag 值, 文案, 图标, 选中色)；tag=null 即「全部」
+    final entries = <(String?, String, IconData, Color)>[
+      (null, '全部', Icons.notes_rounded, ext.primary),
+      (
+        DiaryTag.urgent,
+        '紧急',
+        Icons.priority_high_rounded,
+        DiaryTag.colors[DiaryTag.urgent]!,
+      ),
+      (
+        DiaryTag.star,
+        '收藏',
+        Icons.star_rounded,
+        DiaryTag.colors[DiaryTag.star]!,
+      ),
+      (
+        DiaryTag.idea,
+        '灵感',
+        Icons.lightbulb_rounded,
+        DiaryTag.colors[DiaryTag.idea]!,
+      ),
+    ];
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 10, 20, 0),
+      child: Row(
+        children: [
+          for (var i = 0; i < entries.length; i++) ...[
+            if (i > 0) const SizedBox(width: 8),
+            () {
+              final (tag, label, icon, color) = entries[i];
+              final selected = _tagFilter == tag;
+              return ChoiceChip(
+                avatar: Icon(
+                  icon,
+                  size: 16,
+                  color: selected ? color : ext.textHint,
+                ),
+                label: Text(label),
+                labelStyle: TextStyle(
+                  fontSize: 13,
+                  color: selected ? color : ext.textHint,
+                  fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
+                ),
+                selected: selected,
+                selectedColor: color.withValues(alpha: 0.15),
+                backgroundColor: ext.cardBackground.withValues(alpha: 0.4),
+                side: BorderSide(
+                  color: selected ? color.withValues(alpha: 0.5) : ext.divider,
+                ),
+                visualDensity: VisualDensity.compact,
+                onSelected: (_) {
+                  _updateState(() => _tagFilter = tag);
+                  // 与搜索同款：纯过滤刷新，不清解析缓存
+                  refreshList(clearParseCaches: false);
+                },
+              );
+            }(),
+          ],
         ],
       ),
     );

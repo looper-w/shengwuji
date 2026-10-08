@@ -2,7 +2,7 @@
 
 ## 概述
 
-声物记支持 5 套预设主题皮肤，所有颜色通过 `ThemeExtension` 统一收口。新增主题只需在注册表加一项，UI 自动跟随，无需逐文件改色。
+声物记支持 5 套预设主题皮肤，所有颜色通过 `ThemeExtension` 统一收口。新增主题只需在注册表加一项，UI 自动跟随，无需逐文件改色。2026-09-28 起另有一套**全 App 唯一的深色皮肤**（`dark_standard`），不进主题选择器，由「深色模式」三档设置驱动，见「深色模式」小节。
 
 | ID | 名称 | 种子色 | Pro | 说明 |
 |---|---|---|---|---|
@@ -41,10 +41,11 @@ return Container(color: ext.positiveAccent);
 
 **文件**: [lib/theme/app_theme.dart](../../lib/theme/app_theme.dart)
 
-- `AppThemeDefinition`：单套主题定义，含 ID、名称、种子色、是否 Pro、完整色槽
-- `AppThemes.all`：所有预设主题列表，设置页自动遍历显示
+- `AppThemeDefinition`：单套主题定义，含 ID、名称、种子色、是否 Pro、亮度（`brightness`，浅色恒 light，深色主题专属 dark）、完整色槽
+- `AppThemes.all`：所有预设主题列表（**只含浅色皮肤**），设置页自动遍历显示
 - `AppThemes.defaultTheme`：首次启动默认主题
-- `toThemeData()`：生成带霞鹜文楷字体的 `ThemeData`
+- `AppThemes.dark`：全 App 唯一深色皮肤，**不在 all 中**，只喂 `MaterialApp.darkTheme`（见下节）
+- `toThemeData()`：生成带霞鹜文楷字体的 `ThemeData`（ColorScheme 亮度随 `brightness` 字段）
 
 ### AppRoot — 全局切换入口
 
@@ -53,6 +54,48 @@ return Container(color: ext.positiveAccent);
 - `AppRoot.themeNotifier` 是全局 `ValueNotifier<AppThemeDefinition>`
 - 任意位置 `AppRoot.themeNotifier.value = newTheme` 即可触发整树重建
 - `main()` 启动时从 `SharedPreferences` 的 `selected_theme` 读取并初始化
+- `AppRoot.themeModeNotifier` 是全局 `ValueNotifier<ThemeMode>`（深浅三档，见下节），`main()` 启动时从 `theme_mode` 读取
+
+## 深色模式（2026-09-28 新增）
+
+用户拍板：**只做一套标准深色皮肤**（非各浅色主题的深色变体），主 App 深浅自动/手动切换；**悬浮窗不做深色系**（视觉跨背景对比度设计，与系统深浅无关，且独立 engine 热切换成本高）。
+
+### 三档与生效链路
+
+```
+设置页「外观 → 深色模式」三档 ChoiceChip（跟随系统 / 浅色 / 深色）
+  → prefs key theme_mode（'system'/'light'/'dark'，parseThemeMode 坏串兜底 system）
+  → AppRoot.themeModeNotifier.value = mode（立即整树重建）
+  → MaterialApp(theme: 选中的浅色皮肤, darkTheme: AppThemes.dark, themeMode: mode)
+    themeMode=system 时由 Flutter 框架跟随系统亮度自动选 theme/darkTheme
+```
+
+- 深色皮肤生效时**整体替换**当前选中的浅色皮肤（含自定义主题——自定义主题编辑器是浅色专属，深色模式下不生效）
+- `brightness` 字段保证 `ColorScheme.fromSeed` 产出 dark scheme，Material 组件（SnackBar/Dialog/弹窗）自动走深色配色
+- 状态栏图标亮度走既有 `isDarkOverlay` 槽（深色主题为 true）
+
+### 深色皮肤配色（AppThemes.dark，id=`dark_standard`）
+
+按 Material 深色规范 + 品牌青保留。按钮前景色 2026-09-28 定版**暗色调**（初版曾按「微信深色同款」用白图标白字，真机反馈与暗灰输入框视觉冲突后改近黑；白色在深底界面明度对比太跳）：
+
+| 槽位 | 值 | 依据 |
+|---|---|---|
+| `scaffoldBackground` | `#121212` | Material dark 基准面 |
+| `cardBackground` / `surface` | `#1E1E1E` | 等效 elevation 1 卡片 |
+| `textPrimary/Secondary/Hint` | 白 alpha 87%/60%/38% | Material dark on-surface 规范 |
+| `primary` / `fabReady` | `#009688`（不变） | 品牌青保留做按钮底色 |
+| `fabContentColor`（getter） | 深色=近黑 `black87` / 浅色恒白 | 语音钮图标/确认保存文字前景色：白图标在深底太跳（2026-09-28 真机反馈），黑 87% 叠品牌青 ≈4.7:1 ≥3:1 |
+| `fabClayShadow`（getter） | 深色=仅暗影 / 浅色=白高光+暗影 | 黏土阴影白高光在深底显形为光晕，深色去掉高光只留暗影托底；三处语音圆钮共用唯一真值 |
+| `primaryDark` | `#80CBC4`（反转为亮青） | 语义是"强调文字色"，深底上深色文字不可读 |
+| `primaryLight` | `#1E3A38`（压暗深青容器） | 选中背景 |
+| `splashGradient` 等启动页槽 | 沿用默认主题深海渐变 | 本来就是深底，深浅两态视觉一致 |
+| warning/danger/gold/fab 录音红·处理橙·禁用灰 | 与浅色主题同款 | 5 套预设一致的"语义色不跟随"惯例 |
+
+主文字对比度 ≥12:1、次文字 ≥7:1、强调文字 ≥4.5:1，单测钉在 `test/dark_theme_test.dart`（parseThemeMode 解析/注册约束/配色 sanity/ThemeData 亮度/FAB 前景色与阴影的深浅分支，18 例）。
+
+### 悬浮窗为何不做
+
+悬浮窗卡片是深色半透明胶囊+白描边设计，跨任意背景可读；系统深色不代表悬浮窗下垫的背景是深色。overlay engine 不消费 `theme_mode` key。
 
 ## 切换流程
 

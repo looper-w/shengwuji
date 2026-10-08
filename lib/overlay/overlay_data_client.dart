@@ -92,4 +92,44 @@ class OverlayDataClient {
       rethrow;
     }
   }
+
+  /// 只删数据库行、保留录音文件（滑动删除的撤销窗口用：撤销需把行连同
+  /// 音频一起还原，音频延迟到窗口到期/被打断时由 [deleteAudioFile] 补删）。
+  /// 墓碑由 DbHelper.deleteDiary 内置记录；删库失败 rethrow 让上层回滚
+  Future<void> deleteDiaryRowOnly(int id) async {
+    try {
+      await _dbHelper.deleteDiary(id);
+      print('🗑️ [OverlayDataClient] deleteDiaryRowOnly($id) 成功（音频保留待窗口）');
+    } catch (e, stack) {
+      print('❌ [OverlayDataClient] 直连删除 diary 行($id) 失败: $e');
+      log('deleteDiaryRowOnly error', error: e, stackTrace: stack);
+      rethrow;
+    }
+  }
+
+  /// 撤销删除：行原样插回（sync_uuid 保留、墓碑清除），返回新行 id。
+  /// 调用方：OverlayHome._undoSwipeDelete；失败 rethrow 让上层打日志+重查
+  Future<int> restoreDeletedDiary(Map<String, dynamic> row) async {
+    try {
+      final newId = await _dbHelper.restoreDeletedDiary(row);
+      print('↩️ [OverlayDataClient] restoreDeletedDiary 成功 newId=$newId');
+      return newId;
+    } catch (e, stack) {
+      print('❌ [OverlayDataClient] 直连恢复 diary 行失败: $e');
+      log('restoreDeletedDiary error', error: e, stackTrace: stack);
+      rethrow;
+    }
+  }
+
+  /// 删除录音文件（滑动删除撤销窗口到期/被打断时的落定补删）。
+  /// 失败只打日志不抛——库行早已删除，此处失败仅残留孤儿文件
+  Future<void> deleteAudioFile(String? audioPath) async {
+    if (audioPath == null || audioPath.isEmpty) return;
+    try {
+      await File(audioPath).delete();
+      print('🗑️ [OverlayDataClient] 删除录音文件成功: $audioPath');
+    } catch (e) {
+      print('⚠️ [OverlayDataClient] 删除录音文件失败: $e');
+    }
+  }
 }

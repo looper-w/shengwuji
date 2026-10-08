@@ -166,6 +166,7 @@ void main() {
           'duration': null,
           'is_archived': 0,
           'tag': null,
+          'sort_order': 5,
         },
       ];
       final decoded = decodeDiaryEntries(encodeDiaryEntries(rows));
@@ -178,8 +179,20 @@ void main() {
       final row = decoded[0].toRow();
       expect(row['audio_path'], isNull); // P1 不同步音频，落库置空
       expect(row['is_archived'], 1);
+      expect(decoded[0].sortOrder, isNull); // 归档行 sort_order 恒 NULL
       expect(decoded[1].audioName, isNull);
       expect(decoded[1].isArchived, isFalse);
+      // 排序键（v16 起）随同步载荷往返；落库行保留供 insertRemoteDiaries 决策
+      expect(decoded[1].sortOrder, 5);
+      expect(decoded[1].toRow()['sort_order'], 5);
+    });
+
+    test('日记：老版本云端数据缺 sort_order 字段宽容解码为 null', () {
+      final decoded = decodeDiaryEntries(
+        '[{"uuid":"u9","content":"老数据","created_at":"t"}]',
+      );
+      expect(decoded.single.sortOrder, isNull);
+      expect(decoded.single.toJson().containsKey('sort_order'), isFalse);
     });
 
     test('物品与修正对 round-trip', () {

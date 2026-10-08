@@ -35,8 +35,8 @@ String generateItemsCsv(List<Map<String, dynamic>> items) {
 // 生成日记CSV
 String generateDiaryCsv(List<Map<String, dynamic>> diaries) {
   final rows = [
-    // 标注列（v10）/ 归档列（2026-09）均放最后：旧版本 App 解析只读前几列，天然兼容
-    ['ID', '内容', '创建时间', '音频文件', '时长(秒)', '标注', '归档'],
+    // 标注列（v10）/ 归档列（2026-09）/ 排序列（v16）均放最后：旧版本 App 解析只读前几列，天然兼容
+    ['ID', '内容', '创建时间', '音频文件', '时长(秒)', '标注', '归档', '排序'],
   ];
   for (var diary in diaries) {
     rows.add([
@@ -53,6 +53,9 @@ String generateDiaryCsv(List<Map<String, dynamic>> diaries) {
       diary['tag']?.toString() ?? '',
       // 归档位（'1'/'0'）：随备份走，换机恢复才能保持归档区不变
       diary['is_archived']?.toString() ?? '0',
+      // 排序键（sort_order，v16 起）：归档行恒 NULL 导出为空串；
+      // 活跃行随备份走，换机恢复保持自定义顺序
+      diary['sort_order']?.toString() ?? '',
     ]);
   }
   return rows.map((row) => row.join(',')).join('\n');
@@ -113,6 +116,9 @@ List<Map<String, dynamic>> parseDiaryCsv(String csvContent) {
             : null,
         // 归档列（2026-09 新增，放最后）：旧备份没有第 7 列 → 容忍缺列按活跃处理
         'is_archived': parts.length > 6 && parts[6].trim() == '1' ? 1 : 0,
+        // 排序列（v16 新增，放最后）：旧备份没有第 8 列 → 容忍缺列置 null，
+        // 活跃区 NULL 行由首开回填按时间兜底
+        'sort_order': parts.length > 7 ? int.tryParse(parts[7].trim()) : null,
       });
     }
   }

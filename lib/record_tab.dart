@@ -18,6 +18,7 @@ import '../widgets/neu_widgets.dart';
 import '../app_logger.dart';
 import '../utils/item_splitter.dart';
 import '../utils/correction_learner.dart';
+import '../utils/recognition_activity.dart';
 import '../correction/context_corrector.dart';
 import '../correction/pair_context.dart';
 import '../vad_singleton.dart';
@@ -415,6 +416,33 @@ class RecordTabState extends State<RecordTab> with WidgetsBindingObserver {
       (data) =>
           _audioBuffer.addAll(_convertBytesToFloat32(Uint8List.fromList(data))),
     );
+
+    // 懒启动识别 worker（照抄悬浮窗 overlay_voice_memo.start：录音期间预热
+    // 模型，与录音并行）：
+    //  - preloadModelPath 解析模型目录（dispose 置空过 _currentModelPath 时
+    //    必须重解析，见 recognizer_singleton.dispose）
+    //  - initialize 不 await（冷加载 1~1.5s 被说话时间盖住），失败只 log——
+    //    _stopListening 转写前还有一次 await 兜底
+    try {
+      await RecognizerSingleton.preloadModelPath();
+      unawaited(
+        RecognizerSingleton.instance
+            .initialize()
+            .then((ok) {
+              log(
+                ok
+                    ? '✅ [Record] 识别 worker 已就绪(录音期间并行预热)'
+                    : '⚠️ [Record] 识别 worker 预热失败(停止转写时再兜底)',
+              );
+            })
+            .catchError((Object e) {
+              log('⚠️ [Record] 识别 worker 预热异常(停止转写时再兜底): $e');
+            }),
+      );
+    } catch (e) {
+      // 路径解析失败不阻塞录音：转写阶段兜底 initialize 会再试一次
+      log('⚠️ [Record] 模型路径预加载失败(不中断录音): $e');
+    }
   }
 
   void _stopListening() async {
@@ -430,40 +458,33 @@ class RecordTabState extends State<RecordTab> with WidgetsBindingObserver {
       _statusText = "正在识别...";
     });
 
+    // 在途识别计数：覆盖"守卫加载 + 转写"整段，退后台释放守卫据此顺延
+    //（end 在下方 finally，transcribe 抛错也回退，防计数泄漏导致永不释放）
+    RecognitionActivity.begin();
     // stream 生命周期收进 worker 内管理（识别已迁 worker isolate）
     try {
       // 识别前先加载模型（如果未加载）
+      // ⚠️ 不能再以 hasEverInitialized 短路：退后台释放（main.dart
+      // _backgroundReleaseGuard）后 hasEverInitialized 不回退但 worker 已销毁，
+      // 旧双层守卫会跳过加载直接 transcribe 抛 StateError。统一"未就绪才加载"
+      //（_initEngine 内部归并：并行预热进行中时等待同一轮，不 double spawn）
       if (!_isReady || !_recognizerManager.isReady) {
-        if (!_recognizerManager.hasEverInitialized) {
-          // 显示 loading 提示
-          widget.onLoadingChanged?.call(true, message: "正在加载语音识别模型...");
+        // 显示 loading 提示
+        widget.onLoadingChanged?.call(true, message: "正在加载语音识别模型...");
 
-          try {
-            await _initEngine();
+        try {
+          await _initEngine();
 
+          if (mounted) {
+            widget.onLoadingChanged?.call(false);
+          }
+
+          // 检查加载是否成功
+          if (!_isReady) {
             if (mounted) {
-              widget.onLoadingChanged?.call(false);
-            }
-
-            // 检查加载是否成功
-            if (!_isReady) {
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text("⚠️ 模型加载失败，请检查设置")),
-                );
-                setState(() {
-                  _isProcessing = false;
-                  _statusText = "录音已停止";
-                });
-              }
-              return;
-            }
-          } catch (e) {
-            if (mounted) {
-              widget.onLoadingChanged?.call(false);
-              ScaffoldMessenger.of(
-                context,
-              ).showSnackBar(SnackBar(content: Text("⚠️ 模型加载出错: $e")));
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text("⚠️ 模型加载失败，请检查设置")),
+              );
               setState(() {
                 _isProcessing = false;
                 _statusText = "录音已停止";
@@ -471,6 +492,18 @@ class RecordTabState extends State<RecordTab> with WidgetsBindingObserver {
             }
             return;
           }
+        } catch (e) {
+          if (mounted) {
+            widget.onLoadingChanged?.call(false);
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text("⚠️ 模型加载出错: $e")));
+            setState(() {
+              _isProcessing = false;
+              _statusText = "录音已停止";
+            });
+          }
+          return;
         }
       }
 
@@ -577,6 +610,8 @@ class RecordTabState extends State<RecordTab> with WidgetsBindingObserver {
     } finally {
       // 【最关键】无论成功还是报错必须清理（C++ stream 已收进 worker 内管理，此处只剩缓冲）
       _audioBuffer.clear();
+      // 与方法开头的 begin 配对（转写抛错路径也必须回退，否则引擎永不释放）
+      RecognitionActivity.end();
     }
 
     stopwatch.stop();
@@ -861,9 +896,27 @@ class RecordTabState extends State<RecordTab> with WidgetsBindingObserver {
     });
     try {
       await VadSingleton.instance.initialize();
-      // 保险懒加载识别器
-      if (!_recognizerManager.isReady) {
-        await RecognizerSingleton.instance.initialize();
+      // 懒启动识别 worker（照抄悬浮窗：开录不等模型，冷加载被用户说话时间盖住；
+      // 首段转写处 _recognizeAndSave 有 await 兜底）。"正在初始化..."状态条保留
+      // 作兜底（VAD/TTS 初始化仍在 await，模型加载不再计入）
+      try {
+        await RecognizerSingleton.preloadModelPath();
+        unawaited(
+          RecognizerSingleton.instance
+              .initialize()
+              .then((ok) {
+                log(
+                  ok
+                      ? '✅ [搬家模式] 识别 worker 已就绪(进入期间并行预热)'
+                      : '⚠️ [搬家模式] 识别 worker 预热失败(首段转写时再兜底)',
+                );
+              })
+              .catchError((Object e) {
+                log('⚠️ [搬家模式] 识别 worker 预热异常(首段转写时再兜底): $e');
+              }),
+        );
+      } catch (e) {
+        log('⚠️ [搬家模式] 模型路径预加载失败(不阻塞进入): $e');
       }
       // 懒加载 TTS（首次进搬家模式时拷贝模型+创建实例）
       // 失败不阻塞搬家模式主流程，speak 时再判断 isReady 降级为音效
@@ -1061,14 +1114,28 @@ class RecordTabState extends State<RecordTab> with WidgetsBindingObserver {
     try {
       // 识别走 worker isolate（门面 transcribe），不再主 isolate 直 decode（阻塞 UI）
       if (!_recognizerManager.isReady) {
-        log('⚠️ [搬家模式] 识别器未就绪，跳过本段');
-        setState(() {
-          _isProcessing = false;
-          _statusText = '识别器未就绪';
-        });
-        return;
+        // 兜底等待：入口并行预热若未完成/失败，这里归并等待同一轮加载
+        //（冷启动首段会稍等模型加载，属预期；加载失败才跳过本段）
+        log('⚠️ [搬家模式] 识别器未就绪，等待加载后转写本段');
+        final ok = await RecognizerSingleton.instance.initialize();
+        if (!ok || !_recognizerManager.isReady) {
+          log('⚠️ [搬家模式] 识别器加载失败，跳过本段');
+          setState(() {
+            _isProcessing = false;
+            _statusText = '识别器未就绪';
+          });
+          return;
+        }
       }
-      final rawText = await _recognizerManager.transcribe(samples);
+      // 在途识别计数：防退后台释放守卫在本段 decode 中途 dispose worker
+      //（begin/end 局部配对，抛错也回退）
+      RecognitionActivity.begin();
+      final String rawText;
+      try {
+        rawText = await _recognizerManager.transcribe(samples);
+      } finally {
+        RecognitionActivity.end();
+      }
       log('🎤 [搬家模式] 识别结果: "$rawText"');
       if (rawText.isEmpty) {
         setState(() {
@@ -1380,7 +1447,7 @@ class RecordTabState extends State<RecordTab> with WidgetsBindingObserver {
         width: 45,
         height: 45,
         child: CircularProgressIndicator(
-          color: ext.textOnPrimary,
+          color: ext.fabContentColor,
           strokeWidth: 4,
         ),
       );
@@ -1388,7 +1455,7 @@ class RecordTabState extends State<RecordTab> with WidgetsBindingObserver {
     final isSpeaking = VadSingleton.instance.vad?.isDetected() ?? false;
     return Icon(
       isSpeaking ? Icons.fiber_manual_record : Icons.mic_none,
-      color: ext.textOnPrimary,
+      color: ext.fabContentColor,
       size: 55,
     );
   }

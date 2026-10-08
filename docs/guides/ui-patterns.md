@@ -50,18 +50,20 @@
 #### Diary Tab（日记标签）
 - **颜色主题**: 青色（Teal）
 - **键盘处理**: `resizeToAvoidBottomInset: false`（无文本输入框）
-- **日记卡片交互**：
+- **日记卡片交互**（2026-10-06 改版：长按让位大爆炸，编辑移到双击，取消双击跳 AI——AI 分享保留卡片底部按钮入口）：
   - 单击：复制内容到剪贴板（静默，无 Toast）
-  - 双击：分享到 AI 应用
-  - 长按：弹出底部编辑面板
+  - 双击：弹出底部编辑面板
+  - 长按：大爆炸分词层（锤子 Big Bang 式模态，2026-10-08 起白底浅色化——白色主体 + 透出下层处压暗遮罩明暗分层、选中词块蓝底白字；词块点选/滑选/一键复制，词块区内容纵向居中；复用悬浮窗 `BigBangLayer`，经透明路由推入，层顶边按悬浮窗 8 条面板档位顶部高度取值=152dp 不撑满全屏；底部为透明关闭条——透出下层日记页、整条点击或中间 ✕ 按钮关闭，单手拇指可及；锁定打码卡先过认证、空占位行不触发）
   - 侧滑：归档（活跃日记）或删除（已归档日记）
   - **侧滑动效**：圆圈闭合动画，进度>60%图标渐变为柔红色，快速划动触发删除，动画完成后彻底隐藏防止幽灵卡片
+  - **交换单击与双击**（设置页开关，prefs 历史 key `diary_card_swap_tap_longpress`）：开启后单击=编辑、双击=复制；长按大爆炸不受开关影响。修改后需重启 App 生效
 - **查询答案区**：检测到"XX在哪儿"等查询语句时，卡片正文下方独立显示物品位置预填答案（详见下文"查询答案预填模式"）
 - **归档分区**: 已归档条目单独显示在分割线下方
+- **标注筛选**（2026-09-29）：搜索框与导出按钮之间的筛选图标按钮展开/收起筛选行（默认收起，页面零常驻新增元素；筛选生效时图标右上角带标注色小圆点提示），单选四档 全部/❗紧急/⭐收藏/💡灵感，与搜索关键词在 SQL 层 AND 叠加（`DbHelper.getDiaries(keyword:, tag:)`），归档区同样参与过滤；筛选刷新同搜索走 `clearParseCaches: false` 纯过滤路径
 
 #### Settings Tab（设置标签）
 
-> **2026-09-16 二级页下沉**（commit 22906ad）：主页从 13 组长列表瘦身为「入口行 + 状态摘要」布局，五组低频配置移入 `lib/settings/` 二级页——识别与修正（热词替换 + 智能修正学习合并）、AI 应用分享、悬浮窗设置、音量键快捷操作、关于（更新日志/导出日志/开源许可）。入口行返回后刷新摘要；prefs key 全部不变，各读取方零影响。共享组件在 `lib/settings/settings_widgets.dart`（SectionTitle/Card/EntryRow/ProBadge，主页 `_buildSectionTitle`/`_buildCard` 已改为委托）。预览稿见 [docs/previews/settings_refactor_preview.html](../previews/settings_refactor_preview.html)。
+> **2026-09-16 二级页下沉**（commit 22906ad）：主页从 13 组长列表瘦身为「入口行 + 状态摘要」布局，低频配置移入 `lib/settings/` 二级页——识别与修正（热词替换 + 智能修正学习合并）、AI 应用分享、悬浮窗设置、音量键快捷操作、关于（更新日志/导出日志/开源许可），2026-10-06 起新增大爆炸搜索（搜索引擎 + 浏览器选择）。入口行返回后刷新摘要；prefs key 全部不变，各读取方零影响。共享组件在 `lib/settings/settings_widgets.dart`（SectionTitle/Card/EntryRow/ProBadge，主页 `_buildSectionTitle`/`_buildCard` 已改为委托）。预览稿见 [docs/previews/settings_refactor_preview.html](../previews/settings_refactor_preview.html)。
 
 - 模型管理（内置状态 + 可选导入，入口注释隐藏中）
 - 备份与恢复
@@ -311,7 +313,7 @@ MainActivity + 3 个 `activity-alias` 均声明 `ACTION_SEND` / `text/plain` int
 
 ## Pro 付费解锁弹窗
 
-设置页"支持作者"分区入口（诊断区与关于区之间），点击调起金边 Dialog。弹窗展示作者寄语 + 微信/支付宝真实付款码缩略图 + 解锁按钮。已接入 Pro 功能门禁：主题/皮肤系统中的黑金主题、图标包切换中的节日红/极简白、悬浮窗整体（手势选择器 3 悬浮窗动作 chip 标 Pro 徽章 + 点击拦截弹窗；绕过设置页直接按音量键手势的，原生无障碍服务执行前读落盘 `is_pro_unlocked` 拦截，详见 @../architecture/floating-window.md 的"Pro 门禁"小节）为 Pro 专属，未解锁时点击会调起弹窗。
+设置页"支持作者"分区入口（诊断区与关于区之间），点击调起金边 Dialog。弹窗展示解锁流程说明 + 授权说明（一机一码，换机需重新付费，提示试用满意后再付费）+ 安卓 ID/开发者邮箱（一键复制）+ 微信/支付宝真实付款码缩略图 + 三按钮（扫码支付 / 输入授权码 / 试用 7 天）。已接入 Pro 功能门禁：主题/皮肤系统中的黑金主题、图标包切换中的节日红/极简白、悬浮窗整体（手势选择器 3 悬浮窗动作 chip 标 Pro 徽章 + 点击拦截弹窗；绕过设置页直接按音量键手势的，原生无障碍服务执行前读落盘 `is_pro_unlocked` 拦截，详见 @../architecture/floating-window.md 的"Pro 门禁"小节）为 Pro 专属，未解锁时点击会调起弹窗。
 
 ### 组件
 - **ProUnlockDialog** (`lib/widgets/pro_unlock_dialog.dart`) - `showDialog` + 自定义 Container（不用 AlertDialog，便于做精致金边）
@@ -320,11 +322,13 @@ MainActivity + 3 个 `activity-alias` 均声明 `ACTION_SEND` / `text/plain` int
 | 元素 | 样式 |
 |------|------|
 | 外框 | 白底 + 暖金边框 `#E6C158` 1.5px + 圆角 20 + elevation 8 |
-| 徽章 | 圆形 60×60，浅金底 `#FFF8E7`，`workspace_premium` 图标 |
+| 徽章 | 圆形 52×52，浅金底 `#FFF8E7`，`workspace_premium` 图标 |
 | 标题 | "解锁 Pro"，17pt 粗体 blueGrey |
-| 正文 | 作者寄语 4 句，13pt 黑 0.87 透明度，行高 1.7，居中 |
+| 正文 | 解锁流程说明 4 行（价格 + ①扫码支付 ②发邮件 ③输入授权码），13pt，行高 1.5，居中 |
+| 授权说明 | 浅金底金边横条："授权码一机一码，换机需重新付费授权 / 请试用满意后再付费"，12pt 金色加粗居中 |
+| 信息行 | 安卓 ID + 开发者邮箱两行（浅金底金边，一键复制，发邮件两要素） |
 | 付款码 | 两张 90×90 金边圆角缩略图并排（微信 + 支付宝），点击放大，长按保存到相册 |
-| 解锁按钮 | 暖金 `#D4A437` 白字，已解锁后变灰禁用 |
+| 按钮组 | 主按钮「扫码支付 ¥5 解锁」（暖金白字，已解锁变灰禁用）→「输入授权码解锁」（浅金描边）→「先免费试用 7 天」（未开过试用才显示，试用中显示剩余天数） |
 | 关闭按钮 | TextButton 灰字 |
 
 主色常量：`_kGoldColor #D4A437` / `_kGoldLight #FFF8E7` / `_kGoldBorder #E6C158`

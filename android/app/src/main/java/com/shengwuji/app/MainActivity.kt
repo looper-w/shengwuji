@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.app.AlarmManager
+import android.app.KeyguardManager
 import android.app.PendingIntent
 import android.content.pm.PackageManager
 import android.os.Build
@@ -220,6 +221,11 @@ class MainActivity: FlutterActivity() {
                     val enabled = isAccessibilityServiceEnabled()
                     result.success(enabled)
                 }
+                // 设备诊断信息（品牌/型号/屏幕/导航模式/权限/已启用无障碍服务），
+                // 悬浮窗把手不出现的问题定位用；采集口径见 DeviceDiagnostics 头注释
+                "getDeviceDiagnostics" -> {
+                    result.success(DeviceDiagnostics.collect(this))
+                }
                 "openAccessibilitySettings" -> {
                     val intent = Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -283,11 +289,33 @@ class MainActivity: FlutterActivity() {
                 "getInstalledApps" -> {
                     result.success(getInstalledApps())
                 }
+                // 大爆炸分词层「搜索」按钮：用指定浏览器打开 URL（url_launcher 无法
+                // 指定包名）。packageName 空 = 系统默认；指定包失败回退系统默认再试一次
+                "openUrl" -> {
+                    val url = call.argument<String>("url") ?: ""
+                    val packageName = call.argument<String>("packageName") ?: ""
+                    result.success(openUrl(url, packageName))
+                }
+                // 大爆炸分词层浏览器选择器：列出能打开网页的应用（名称+包名）
+                "getInstalledBrowsers" -> {
+                    result.success(getInstalledBrowsers())
+                }
                 // 笔记锁定：主 App（DiaryTab）发起系统认证。与悬浮窗同一条
                 // NoteUnlockCoordinator 链路（锁屏中 requestDismissKeyguard /
                 // 未锁屏 BiometricPrompt），结果经 flutterChannel 推 noteUnlockResult
                 "requestUnlockAuth" -> {
                     result.success(NoteUnlockCoordinator.launch(this, fromOverlay = false))
+                }
+                // 笔记加锁前置检查：设备是否已设锁屏凭据（PIN/图案/密码）。
+                // 未设置时不允许锁定笔记——锁定后没有任何认证手段能看回内容，
+                // 锁定形同虚设反而误导用户（Dart 侧弹引导对话框）
+                "isDeviceSecure" -> {
+                    val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+                    result.success(km.isDeviceSecure)
+                }
+                // 引导用户去系统「安全」设置页设锁屏密码（加锁引导对话框「去设置」）
+                "openSecuritySettings" -> {
+                    result.success(openSecuritySettings())
                 }
                 // 图标按需懒加载（列表接口不带图标，避免一次性传几百张图）
                 "getAppIcon" -> {
@@ -703,6 +731,65 @@ class MainActivity: FlutterActivity() {
         apps.sortWith(compareBy(collator) { it["appName"] ?: "" })
         println("📱 [MainActivity] getInstalledApps: ${apps.size} 个桌面应用")
         return apps
+    }
+
+    // --- 大爆炸分词层「搜索」按钮：浏览器打开 URL / 浏览器枚举 ---
+
+    /** 打开 URL；packageName 非空时锁定该应用（指定浏览器），失败回退系统默认重试一次 */
+    private fun openUrl(url: String, packageName: String): Boolean {
+        if (url.isEmpty()) return false
+        if (packageName.isNotEmpty()) {
+            try {
+                startActivity(
+                    Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))
+                        .setPackage(packageName)
+                )
+                println("🌐 [MainActivity] openUrl 指定浏览器: $packageName $url")
+                return true
+            } catch (e: android.content.ActivityNotFoundException) {
+                println("⚠️ [MainActivity] 指定浏览器不可用 $packageName，回退系统默认: $e")
+            }
+        }
+        return try {
+            startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+            println("🌐 [MainActivity] openUrl 系统默认: $url")
+            true
+        } catch (e: android.content.ActivityNotFoundException) {
+            println("❌ [MainActivity] openUrl 失败: $e")
+            false
+        }
+    }
+
+    /** 拉起系统「安全」设置页（引导用户设置锁屏密码），返回是否成功拉起 */
+    private fun openSecuritySettings(): Boolean {
+        return try {
+            startActivity(Intent(Settings.ACTION_SECURITY_SETTINGS))
+            println("🔒 [MainActivity] 已拉起系统安全设置页")
+            true
+        } catch (e: Exception) {
+            println("❌ [MainActivity] 拉起安全设置页失败: $e")
+            false
+        }
+    }
+
+    /** 能打开网页的应用（浏览器选择器用）：按包名去重、排除自身、名称中文排序 */
+    private fun getInstalledBrowsers(): List<Map<String, String>> {
+        val pm = packageManager
+        val browsers = mutableListOf<Map<String, String>>()
+        val seen = mutableSetOf<String>()
+        val self = packageName
+        val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://example.com"))
+        for (info in pm.queryIntentActivities(intent, 0)) {
+            val pkg = info.activityInfo.packageName
+            if (pkg == self || !seen.add(pkg)) continue
+            val label = info.loadLabel(pm)?.toString()?.trim() ?: continue
+            if (label.isEmpty()) continue
+            browsers.add(mapOf("appName" to label, "packageName" to pkg))
+        }
+        val collator = java.text.Collator.getInstance(java.util.Locale.CHINA)
+        browsers.sortWith(compareBy(collator) { it["appName"] ?: "" })
+        println("🌐 [MainActivity] getInstalledBrowsers: ${browsers.size} 个浏览器")
+        return browsers
     }
 
     /** 应用图标转 PNG 字节（缩到 96px 控制传输体积）；查不到/转换失败返回 null，Dart 侧兜底占位图标 */

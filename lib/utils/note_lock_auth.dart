@@ -22,4 +22,31 @@ class NoteLockAuth {
       return false;
     }
   }
+
+  /// 设备是否已设置锁屏凭据（PIN/图案/密码）。笔记**加锁**前置检查——
+  /// 未设置时不允许锁定：锁定后没有任何认证手段能看回内容，锁定形同虚设
+  /// 反而误导用户以为已保护。通道异常按「未设置」兜底（安全侧失败关闭）
+  static Future<bool> isDeviceSecure() async {
+    try {
+      return await MethodChannel(
+        'com.shengwuji.app/app',
+      ).invokeMethod('isDeviceSecure') == true;
+    } catch (e) {
+      print('❌ [NoteLockAuth] 查询锁屏凭据失败: $e');
+      return false;
+    }
+  }
+
+  /// 拉起系统「安全」设置页（加锁引导对话框「去设置」按钮，引导用户先设
+  /// 锁屏密码再回来锁定）。返回 true = 已拉起
+  static Future<bool> openSecuritySettings() async {
+    try {
+      return await MethodChannel(
+        'com.shengwuji.app/app',
+      ).invokeMethod('openSecuritySettings') == true;
+    } catch (e) {
+      print('❌ [NoteLockAuth] 拉起安全设置页失败: $e');
+      return false;
+    }
+  }
 }

@@ -7,6 +7,7 @@ import '../utils/pro_gate.dart';
 import '../utils/quick_record_auto_stop.dart'; // 快速录音说完自动停止配置（key/档位唯一真值，两个录音入口开录时读同一组 key）
 import '../utils/volume_gesture_config.dart'; // 音量键手势槽位配置（4 槽位动作选择器）
 import 'accessibility_check.dart';
+import 'accessibility_keepalive_page.dart';
 import 'settings_widgets.dart';
 
 /// 「音量键快捷操作」二级页（zcode: 2026-09 设置页下沉——原主页分组整体搬入：
@@ -312,6 +313,25 @@ class _VolumeKeySettingsPageState extends State<VolumeKeySettingsPage>
       body: ListView(
         padding: const EdgeInsets.all(20),
         children: [
+          // 失灵排查入口置顶：无障碍被系统杀后台关闭是用户反馈最高频的问题，
+          // 无论当前服务开关状态都展示（服务此刻开着 ≠ 明天不被系统关掉）
+          SettingsCard(
+            padding: EdgeInsets.zero,
+            child: SettingsEntryRow(
+              icon: Icons.help_outline,
+              title: '音量键没反应？看这里',
+              subtitle: '无障碍服务经常被系统自动关闭的解决办法',
+              onTap: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => const AccessibilityKeepAlivePage(),
+                  ),
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 24),
+
           SettingsCard(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,

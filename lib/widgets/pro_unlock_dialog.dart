@@ -58,7 +58,8 @@ void _showFloatingTip(BuildContext context, String text) {
 /// 收到回复的授权码 → 在本弹窗输入 → Kotlin 侧哈希比对通过后永久解锁。
 /// 不便付款可点「先试用 7 天」一次性全量试用（到期后各门禁点拦截）。
 ///
-/// 展示内容：付款码（微信/支付宝，可放大/存相册）+ 安卓 ID 与收款邮箱（一键复制，
+/// 展示内容：付款码（微信/支付宝，可放大/存相册）+ 授权说明（一机一码，
+/// 换机需重新付费，提示试用满意后再付费）+ 安卓 ID 与收款邮箱（一键复制，
 /// 用户发邮件直接粘贴）+ 三按钮（扫码支付 / 先试用 7 天 / 输入授权码）。
 /// 旧的「自觉点按钮解锁」君子协定出口已随授权码体系移除。
 /// 关闭返回值 = Pro 是否已可用（试用激活或授权码验证成功时 pop(true)）。
@@ -335,6 +336,27 @@ class _ProUnlockDialogState extends State<ProUnlockDialog> {
                   color: Colors.black87,
                 ),
                 textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 8),
+              // 授权说明（用户拍板补充）：一机一码，换机需重新付费——
+              // 醒目金色提示，放在流程说明与安卓 ID 之间（用户扫码付款前必看）
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: _kGoldLight,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: _kGoldBorder),
+                ),
+                child: const Text(
+                  '授权码一机一码，换机需重新付费授权\n请试用满意后再付费',
+                  style: TextStyle(
+                    fontSize: 12,
+                    height: 1.4,
+                    color: _kGoldColor,
+                    fontWeight: FontWeight.bold,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
               ),
               const SizedBox(height: 12),
               // 安卓 ID + 收款邮箱（发邮件两要素，一键复制）

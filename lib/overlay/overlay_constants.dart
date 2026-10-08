@@ -9,10 +9,20 @@ import 'package:flutter/material.dart';
 ///   DiaryTag.colors），图标文字白色
 /// - [pill3d] 拟物胶囊💊：上白 / 下珊瑚红 + 左侧高光条 + 下半暗部渐变的
 ///   立体药丸，纯造型无图标无文字（用户定夺"没有文字的风格"）
-enum HandleTheme {
-  duo,
-  bluePurple,
-  pill3d,
+enum HandleTheme { duo, bluePurple, pill3d }
+
+/// 息屏（ACTION_SCREEN_OFF）时悬浮窗的去向（
+/// [OverlayConstants.screenOffActionFor] 的返回值）
+enum ScreenOffAction {
+  /// 把手驻留穿越 AOD（「永久」档）：窗口仅由 Kotlin GONE/VISIBLE 随
+  /// 息屏/亮屏切换可见性，Dart 不推进状态，亮屏后把手原样回来
+  keepHandle,
+
+  /// 缩成贴边竖线驻留（限时档 + 「隐藏后保留贴边竖线」开关开）
+  enterEdgeLine,
+
+  /// 彻底移除悬浮窗窗口（限时档 + 竖线开关关），只能音量键重新召唤
+  closeOverlay,
 }
 
 /// [HandleTheme] 的渲染属性（色值与内容显隐），OverlayHandle 与设置页
@@ -57,9 +67,24 @@ class OverlayConstants {
   static const int handleWidth = 28;
 
   /// 收起态把手高度（dp）。语音胶囊窗口高（voiceMemoWindowHeight 84）必须
-  /// 小于本值——overlay_home build 的硬不变量按「窗口高 < 把手高」判定
-  /// idle 帧渲染空白
+  /// 小于本值——overlay_home build 的硬不变量按 [isCapsuleHeightWindow]
+  /// 判定 idle 帧渲染空白
   static const int handleHeight = 88;
+
+  /// 把手窗口 vs 语音胶囊窗口的判定阈值（dp）：两设计高度（88/84）的中点。
+  /// dp→px 换算取整误差恒 <1px（≤1dp，密度越高越小），把手窗实测最低 ≈87.0、
+  /// 胶囊窗实测最高 ≈84.5，极端值都落在本阈值两侧安全区内
+  static double get handleWindowHeightThreshold =>
+      (handleHeight + voiceMemoWindowHeight) / 2;
+
+  /// 窗口实测高度是否属于「语音胶囊高度档」（overlay_home 硬不变量用：
+  /// idle 帧在胶囊高度窗口里渲染空白，防把手像素混进语音速记冷启动帧）。
+  /// ⚠️ 不能用 maxHeight < handleHeight 判定——Kotlin dpToPx 取整会让把手
+  /// 窗口实测比设计值小（88dp @density2.8125 → 247px → 87.8dp），真机反馈
+  /// 「把手/竖线点按后变空白」即此误杀（详见 docs/architecture/
+  /// floating-window.md「硬不变量高度误判」小节）
+  static bool isCapsuleHeightWindow(double maxHeight) =>
+      maxHeight < handleWindowHeightThreshold;
 
   /// ── 把手大小档位（2026-09-22，用户反馈把手胶囊有点大、可调）──
   ///
@@ -92,6 +117,32 @@ class OverlayConstants {
   ///（拟物胶囊💊纯造型无文字，用户定夺 2026-09-22）
   static bool handleShowsLabel(int percent, HandleTheme theme) =>
       percent >= handleSizePercents.first && theme != HandleTheme.pill3d;
+
+  /// ── 日记面板字体大小档位（2026-09-27，用户要求可调）──
+  ///
+  /// 五档：-2/-1/0（标准，历史视觉）/+1/+2，每档 = 1pt（0.5pt 档差真机不可辨，
+  /// 2pt 档差最小档收起胶囊 12→8 跌破可读性下限，1pt 是档差可感知与下限可读
+  /// 的折中）。作用范围 = 日记面板文字（收起胶囊/展开正文/时间行/重放行/删除
+  /// 确认行/已归档分隔线/空态错误态）；不作用：把手「闪记」（有独立把手大小
+  /// 档位管视觉缩放，叠加会双重缩放）、语音速记胶囊（宽度预算按 15 号字调过）、
+  /// 各类临时提示胶囊（转瞬 UI）。
+  /// prefs key（int；写入方：设置页悬浮窗二级页；读取方：overlay engine 的
+  /// _refreshOverlayConfig/_scheduleAutoHide——跨 engine 各自读，无内存共享）
+  static const String fontSizeStepPrefKey = 'overlay_font_size_step';
+  static const int fontSizeStepMin = -2;
+  static const int fontSizeStepMax = 2;
+  static const int fontSizeStepDefault = 0;
+
+  /// 解析 prefs 档位值：null 兜底标准档，越界/坏值 clamp 到 [-2, 2]
+  ///（范围语义，与把手大小的合法集合白名单不同——档位是连续刻度）
+  static int parseFontSizeStep(int? raw) => raw == null
+      ? fontSizeStepDefault
+      : raw.clamp(fontSizeStepMin, fontSizeStepMax);
+
+  /// 档位 → 实际字号：基准 + 档位（每档 1pt）。调用方传各基准常量/字面量，
+  /// 文字测量（TextPainter）与渲染必须用同一缩放值，否则胶囊宽度估算偏窄
+  /// 会把短文字顶出省略号（046fe0b 同款不变量）
+  static double fontScaled(double base, int step) => base + step;
 
   /// ── 把手主题（皮肤，2026-09-22）──
   /// prefs key（string = enum name；写入方：设置页悬浮窗二级页；读取方：
@@ -247,6 +298,25 @@ class OverlayConstants {
   /// 卡片字号（展开/清单等场景通用；用户要求展开态也用 13 号）
   static const double cardFontSize = 13.0;
 
+  /// 大爆炸分词层（展开卡正文长按唤起，big_bang_layer.dart）：
+  /// 词块基准字号（比正文大两档，词块即触控目标；随字体大小档位 ±1pt 缩放）
+  static const double bigBangFontSize = 17.0;
+
+  /// 大爆炸层背景：近不透明白色（2026-10-08 起由深色改浅色，对齐锤子原版
+  /// Big Bang 白色卡片视觉；全屏模态盖住面板与空白区，留白 2% 透明让下层
+  /// 隐约在场，关闭时无跳变感）。文字/词块配色随之反转（深字浅底）
+  static const Color bigBangBackground = Color(0xFAFFFFFF);
+
+  /// 大爆炸层顶部留白区/底部关闭条/四角圆角缺口的下层压暗遮罩（用户拍板：
+  /// 透出下层画面但要明显压暗，明暗分层让白色主体浮出）。35% 黑——下层
+  /// 内容仍隐约可辨，但明确退到「下一层」
+  static const Color bigBangScrimColor = Color(0x59000000);
+
+  /// 大爆炸层四角圆弧半径（用户拍板：四周边缘圆弧化，主 App/悬浮窗共用
+  /// 本层一处生效）。圆角缺口透出下层画面，与顶部透明留白/底部透明关闭条
+  /// 同一「层不撑满全屏」的视觉语言
+  static const double bigBangCornerRadius = 20.0;
+
   /// 收起态胶囊字号（比展开态 cardFontSize 小 1：配合收窄后的两端控件与
   /// padding，胶囊达到最大宽度时单行可显示 9 个汉字 + 省略号——小米15
   /// 1200×2670 460ppi→density 3.0，用户开 125% 显示缩放→density 3.75→
@@ -309,11 +379,71 @@ class OverlayConstants {
   static const int maxVisibleDiaryCards = 10;
 
   /// 面板日记列表区域的最大高度（dp）= maxVisibleDiaryCards × (卡片高+间距)
-  /// + 列表上下 padding（top 8 / bottom 48，与 _buildPanel 的 ListView padding
-  /// 保持一致）。卡片按收起态估算，展开卡变高属预期、区域高度不变。
-  /// 读取方：OverlayHome._buildPanel
+  /// + 列表顶部 padding（top 8，与 _buildPanel 的 ListView padding 保持一致）。
+  /// 卡片按收起态估算，展开卡变高属预期、区域高度不变。
+  /// ⚠️ 不加底部 padding 48：ListView/SliverPadding 的 padding 只计入滚动
+  /// 范围不裁剪视口——滚动到顶时视口内卡片可见区 = 限高 − top padding，
+  /// 底部 padding 要到滚到底才出现。历史上把 +48 也算进限高，导致实际可见
+  /// 卡片数恒比 maxVisibleDiaryCards 多 1 张（48 > 卡高 46，第 N+1 张完整
+  /// 露出），真机实测 10 档见 11 张 / 6 档见 7 张。
+  /// 不变量：恒等于 panelListMaxHeightFor(panelMaxCardsDefault)（测试钉住）。
+  /// 读取方：OverlayHome._buildPanel（经 panelListMaxHeightFor(_panelMaxCards)）
   static const double panelListMaxHeight =
-      maxVisibleDiaryCards * (cardHeight + cardSpacing) + 8 + 48;
+      maxVisibleDiaryCards * (cardHeight + cardSpacing) + 8;
+
+  /// ── 面板高度（可见条数档位，设置页「面板高度」选择器，2026-10-06）──
+  /// 用户需求：大屏手机单手拿时，面板顶部的新建/展开按钮在屏幕上方够不着。
+  /// 减少可见条数 = 列表限高变矮 + 面板顶部下压等量偏移（每少 1 条下压一张
+  /// 卡高）——面板是**顶部锚定**布局，只缩列表限高只会让底边上移、按钮原地
+  /// 不动；配上顶部下压偏移才兑现「整列底边位置不变、顶部按钮组下移进
+  /// 拇指区」。单位用条数（比高/中/低档位直观）。
+  /// prefs int，6~10 连续刻度 clamp 语义（同 fontSizeStep，非白名单）。
+  /// 读取方：overlay engine 的 _refreshOverlayConfig/_scheduleAutoHide +
+  /// _buildPanel；生效时机同把手大小——下一次展开/收起状态转换，已展开的
+  /// 面板不瞬移
+  static const String panelMaxCardsPrefKey = 'overlay_panel_max_cards';
+
+  /// 面板 header 顶部固定避让（dp）：全屏窗口（FLAG_LAYOUT_NO_LIMITS）延伸到
+  /// 状态栏下，overlay 窗口拿不到系统 insets，用固定 padding 避让状态栏。
+  /// 读取方：OverlayHome._buildHeader（header Padding top）、大爆炸层顶边
+  ///（再叠 panelTopOffsetFor 对齐 header 上缘）——两处必须同源
+  static const double panelHeaderTopPadding = 40.0;
+
+  /// 条数档下限：6 条再低列表区太矮（2 屏手势都难滚出内容），且顶部按钮
+  /// 已下压 4 张卡高（224dp），继续下压收益递减
+  static const int panelMaxCardsMin = 6;
+
+  /// 条数档上限 = 历史默认（10 条 = 改动前的固定行为）
+  static const int panelMaxCardsMax = maxVisibleDiaryCards;
+  static const int panelMaxCardsDefault = maxVisibleDiaryCards;
+
+  /// 解析可见条数档位：缺失兜底默认档，越界脏值 clamp 到 [6,10]
+  static int parsePanelMaxCards(int? raw) => raw == null
+      ? panelMaxCardsDefault
+      : raw.clamp(panelMaxCardsMin, panelMaxCardsMax);
+
+  /// 列表区域限高（dp）按可见条数档位计算；默认档结果 == panelListMaxHeight。
+  /// 只加顶部 padding 8（bottom padding 48 在滚动范围末尾，不占视口——见
+  /// panelListMaxHeight 注释的差一条说明）
+  static double panelListMaxHeightFor(int cards) =>
+      cards * (cardHeight + cardSpacing) + 8;
+
+  /// 面板顶部下压偏移（dp）=（默认条数 − 当前档）× 一张卡高。
+  /// 设计不变量：panelTopOffsetFor(n) + panelListMaxHeightFor(n) 对任意档位
+  /// 为定值——满列表时整列底边位置不随档位变化（测试钉住）
+  static double panelTopOffsetFor(int cards) =>
+      (panelMaxCardsDefault - cards) * (cardHeight + cardSpacing);
+
+  /// 主 App 大爆炸分词层顶边的参照条数档（用户拍板：主 App 没有「面板高度」
+  /// 设置项，层顶边固定按悬浮窗 8 条档位的顶部高度取值——比「仅状态栏避让」
+  /// 矮一截，单手够得着顶栏）
+  static const int bigBangMainAppRefCards = 8;
+
+  /// 主 App 大爆炸分词层顶边高度（dp）= 状态栏固定避让 + 参照条数档下压
+  /// 偏移，与悬浮窗「面板高度」8 条档位时的大爆炸层顶边同源同值（152dp）。
+  /// 读取方：diary_tab._openBigBang（BigBangLayer.topInset）
+  static double get bigBangMainAppTopInset =>
+      panelHeaderTopPadding + panelTopOffsetFor(bigBangMainAppRefCards);
 
   /// 卡片固定默认色（无标注的活跃卡片）。标注（紧急/收藏/灵感）后整卡换
   /// 标注色（色映射唯一真值在 utils/diary_tag.dart 的 DiaryTag.colors，
@@ -414,8 +544,8 @@ class OverlayConstants {
   /// 胶囊（见 [voiceMemoHintGap] 与 _StopHintPill），展示时"胶囊 + 间距 + 提示
   /// 胶囊"整块（≈68）在 84 高窗口内垂直居中，胶囊仅比历史位置上移 ~8dp；
   /// 不展示时单一胶囊居中。上限守卫：必须 < handleHeight(88)——overlay_home
-  /// build 的硬不变量（idle 帧在胶囊窗口里渲染空白）按"窗口高 < 把手高"判定，
-  /// ≥88 会让 idle 帧误渲染把手
+  /// build 的硬不变量（idle 帧在胶囊窗口里渲染空白）按 [isCapsuleHeightWindow]
+  /// 判定，≥88 会与把手窗高度档重叠、idle 帧误渲染把手
   static const int voiceMemoWindowHeight = 84;
 
   /// 转写态胶囊固定宽度（dp）
@@ -453,6 +583,27 @@ class OverlayConstants {
   /// bool key）；_scheduleAutoHide 读到本值即不起 Timer。取 -1 而非 0，
   /// 避免 0 被误读成"立即隐藏"
   static const int autoHideNeverSeconds = -1;
+
+  /// 息屏（ACTION_SCREEN_OFF）时悬浮窗的去向分流（唯一权威，OverlayHome
+  /// ._onScreenAutoHide 消费；展开面板在分流前已无条件跳终态收回把手，
+  /// 面板永不穿越息屏）：
+  /// - 「永久」档（autoHideSeconds == [autoHideNeverSeconds]）→ keepHandle：
+  ///   把手驻留穿越 AOD——息屏期间窗口由 Kotlin 置 GONE 保 AOD 干净，亮屏
+  ///   VISIBLE 把手原样回来，不再推进竖线/移除（2026-09-28 用户拍板，推翻
+  ///   09-22「永久档息屏不生效」旧语义；竖线开关在永久档下对息屏不生效）
+  /// - 限时档 → 按「隐藏后保留贴边竖线」开关：开 = enterEdgeLine /
+  ///   关 = closeOverlay（09-22「进 AOD 必须收」语义不变）
+  static ScreenOffAction screenOffActionFor(
+    int autoHideSeconds, {
+    required bool edgeLineEnabled,
+  }) {
+    if (autoHideSeconds == autoHideNeverSeconds) {
+      return ScreenOffAction.keepHandle;
+    }
+    return edgeLineEnabled
+        ? ScreenOffAction.enterEdgeLine
+        : ScreenOffAction.closeOverlay;
+  }
 
   /// ── 自动隐藏后的贴边竖线（隐藏态驻留提示，"把手的瘦身版"）──
   ///
@@ -512,6 +663,43 @@ class OverlayConstants {
   static const String edgeLineTapEnabledPrefKey =
       'overlay_edge_line_tap_enabled';
 
+  /// ── 竖线距屏幕边缘的内移间距档位（2026-09-29）──
+  ///
+  /// 用户反馈：贴带黑边的钢化膜后，完全贴边的竖线可能被膜边遮住看不见。
+  /// 三档：0（贴边，缺省=历史行为）/ 4（内移）/ 8（最里，用户实测拍板——
+  /// 首版 0/8/16 的 16 档内移过多，整体下调为 0/4/8）。**纯 Dart 视觉内移**：窗口 20×64 与透明触摸缓冲区不动
+  ///（同把手大小「只缩视觉不缩窗口」思路），竖线在窗口内向屏内侧偏移——
+  /// 窗口内可内移的硬上限 = [edgeLineWindowWidth] − [edgeLineWidth] = 16，
+  /// 当前档位最大只用 8。⚠️ 不要靠加宽窗口换更大间距：窗口宽 >24 会撞
+  /// Kotlin `EDGE_LINE_WIDTH_THRESHOLD_DP`=24 的线态判定（音量键 toggle
+  /// 分流），且边缘触摸带加宽会多挡下层
+
+  /// 间距档位的 prefs key（写入方：悬浮窗设置二级页 overlay_settings_page；
+  /// 读取方：OverlayHome._refreshOverlayConfig/_scheduleAutoHide——跨 engine
+  /// 各自 reload 读，下一次状态转换生效，已驻留的竖线不瞬移）
+  static const String edgeLineMarginPrefKey = 'overlay_edge_line_margin_dp';
+
+  /// 缺省档位：贴边（历史行为）
+  static const int edgeLineMarginDefault = 0;
+
+  /// 合法档位集合（dp，设置页 ChoiceChip 与解析兜底共用）
+  static const List<int> edgeLineMarginChoices = [0, 4, 8];
+
+  /// 解析 prefs 间距档位：非合法档（null/旧版本值/坏值）一律兜底贴边
+  static int parseEdgeLineMargin(int? raw) =>
+      raw != null && edgeLineMarginChoices.contains(raw)
+      ? raw
+      : edgeLineMarginDefault;
+
+  /// 档位 + 停靠侧 → 竖线的靠边侧内边距（停靠右缘内移 = right padding，
+  /// 左缘镜像）。供 OverlayHome._buildEdgeLine 与单测共用唯一真值
+  static EdgeInsets edgeLinePadding({
+    required bool sideLeft,
+    required int marginDp,
+  }) => sideLeft
+      ? EdgeInsets.only(left: marginDp.toDouble())
+      : EdgeInsets.only(right: marginDp.toDouble());
+
   /// ── 悬浮窗停靠侧（左/右切换）──
   ///
   /// 设置页「停靠侧」选择器的 prefs key（bool 通道）：false（缺省）= 停靠
@@ -528,4 +716,19 @@ class OverlayConstants {
   /// 下一次展开/收起整体换到新侧；已显示中的收起把手不瞬移（跨 engine
   /// 无推送通道，不做轮询）
   static const String overlaySideLeftPrefKey = 'overlay_side_left';
+
+  /// ── 滑动直接删除（替代滑动归档）──
+  ///
+  /// 设置开关「滑动直接删除笔记」的 prefs key（写入方：悬浮窗设置二级页
+  /// overlay_settings_page；读取方：OverlayHome._onCardSwipeDismissed——
+  /// 动作型开关，划走回调里现场 reload 读，即时生效，同
+  /// edgeLineTapEnabledPrefKey 的 _onEdgeLineTap 模式）。
+  /// 缺省 false = 划走归档（历史行为）；true = 活跃卡划走直接删除，
+  /// 面板顶部弹撤销胶囊（[swipeDeleteUndoWindow] 内可撤销，真删后重插），
+  /// 归档入口由卡片顶端勾选框保留。已归档卡划走=删除的行为不受本开关影响
+  static const String swipeDeletePrefKey = 'overlay_swipe_delete_enabled';
+
+  /// 滑动删除的撤销窗口时长：到期后删除落定（录音文件此刻才从磁盘补删；
+  /// 窗口内撤销靠把库行原样插回，音频不删才能连录音一起还原）
+  static const Duration swipeDeleteUndoWindow = Duration(seconds: 3);
 }

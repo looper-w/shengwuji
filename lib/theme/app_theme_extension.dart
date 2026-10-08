@@ -290,4 +290,47 @@ class AppThemeExtension extends ThemeExtension<AppThemeExtension> {
   static AppThemeExtension of(BuildContext context) {
     return Theme.of(context).extension<AppThemeExtension>()!;
   }
+
+  /// 深色界面判定（scaffold 亮度阈值）：深色主题 #121212 远低于 0.2，
+  /// 浅色主题（含自定义极浅底）远高于——FAB 前景色/阴影自适应的唯一判据
+  bool get isDarkSurface => scaffoldBackground.computeLuminance() < 0.2;
+
+  /// 语音圆钮/主色大按钮的前景色（麦克风图标、确认保存文字）：
+  /// - 浅色主题恒白（2026-09-23 恒白承诺：自定义主题主色偏浅时
+  ///   textOnPrimary 按 WCAG 会落深色，麦克风变黑不一致，故语音钮不用该槽）
+  /// - 深色主题近黑：白图标在深底界面太跳（2026-09-28 真机反馈「起码不能
+  ///   亮色的白」）；black87 叠在品牌青 #009688 上视觉对比度 ≈4.7:1
+  ///   （≥3:1 大图标/粗体 AA），录音红/处理橙底上更高，视觉也比纯白收敛
+  Color get fabContentColor =>
+      isDarkSurface ? Colors.black87 : Colors.white;
+
+  /// 黏土拟态 FAB 阴影（diary_floating_button / main.dart 查物品浮钮 /
+  /// 录入页钉底栏三处共用，唯一真值——历史上靠注释约定「三处同步」，易漏）
+  ///
+  /// - 浅色主题：白高光（左上）+ 暗影（右下），光源从上方的黏土质感
+  /// - 深色主题：白高光在深底上显形为一圈光晕（2026-09-28 真机反馈），
+  ///   去掉高光只留一道稍重的暗影托底（Material 深色规范也只有暗影）
+  List<BoxShadow> get fabClayShadow => isDarkSurface
+      ? [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.35),
+            offset: const Offset(0, 4),
+            blurRadius: 10,
+          ),
+        ]
+      : [
+          // 顶部高光阴影（模拟光源从上方）；高光固定白——自定义主题
+          // textOnPrimary 是深色会把高光染成黑晕（2026-09-23 教训）
+          BoxShadow(
+            color: Colors.white.withValues(alpha: 0.4),
+            offset: const Offset(-4, -4),
+            blurRadius: 8,
+          ),
+          // 底部深色阴影（模拟凹陷感）
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.12),
+            offset: const Offset(4, 4),
+            blurRadius: 10,
+          ),
+        ];
 }

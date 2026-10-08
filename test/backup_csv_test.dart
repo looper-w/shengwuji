@@ -16,6 +16,7 @@ void main() {
           'duration': 8,
           'tag': null,
           'is_archived': 0,
+          'sort_order': -2,
         },
         {
           'id': 2,
@@ -25,6 +26,7 @@ void main() {
           'duration': 9,
           'tag': 'star',
           'is_archived': 1,
+          'sort_order': null,
         },
       ];
 
@@ -35,9 +37,12 @@ void main() {
       expect(parsed[0]['is_archived'], 0);
       expect(parsed[0]['tag'], isNull);
       expect(parsed[0]['audio_path'], 'a.m4a');
+      // 排序列（v16 第 8 列）：活跃行随备份还原，归档行恒 NULL
+      expect(parsed[0]['sort_order'], -2);
       expect(parsed[1]['created_at'], '2026-09-20T11:00:00.654321');
       expect(parsed[1]['is_archived'], 1);
       expect(parsed[1]['tag'], 'star');
+      expect(parsed[1]['sort_order'], isNull);
     });
 
     test('用户复现场景：A 活跃 + B/C 归档，原封再导入全部命中去重', () {
@@ -128,6 +133,8 @@ void main() {
       expect(parsed.single['created_at'], '2026-08-01T10:20:30.000');
       expect(parsed.single['is_archived'], 0);
       expect(parsed.single['tag'], 'urgent');
+      // 7 列旧备份缺排序列 → null（活跃区由首开回填按时间兜底）
+      expect(parsed.single['sort_order'], isNull);
     });
 
     test('老备份时间与库内亚秒原行在去重键下同键（不再整包判新）', () {

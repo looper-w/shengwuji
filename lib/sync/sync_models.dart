@@ -22,6 +22,7 @@ class DiarySyncEntry {
     this.isArchived = false,
     this.isLocked = false,
     this.tag,
+    this.sortOrder,
   });
 
   final String uuid;
@@ -40,6 +41,11 @@ class DiarySyncEntry {
   /// 标注（'urgent'/'star'/'idea'，null=无）
   final String? tag;
 
+  /// 活跃区自定义排序键（v16 起；归档行恒 null）。是否被对端采纳由
+  /// 落库方决策：对端活跃区为空（换机全量恢复）才尊重，否则远端新行
+  /// 统一堆对端活跃区顶部（见 DbHelper.insertRemoteDiaries）
+  final int? sortOrder;
+
   /// 本地 diary 表行 → 载荷（audio_path 全路径取 basename）
   factory DiarySyncEntry.fromRow(Map<String, dynamic> row) {
     final audioPath = row['audio_path'] as String?;
@@ -54,6 +60,7 @@ class DiarySyncEntry {
       isArchived: (row['is_archived'] as int? ?? 0) != 0,
       isLocked: (row['is_locked'] as int? ?? 0) != 0,
       tag: row['tag'] as String?,
+      sortOrder: row['sort_order'] as int?,
     );
   }
 
@@ -66,6 +73,7 @@ class DiarySyncEntry {
     'is_archived': isArchived ? 1 : 0,
     'is_locked': isLocked ? 1 : 0,
     'tag': tag,
+    'sort_order': sortOrder,
   };
 
   Map<String, dynamic> toJson() => {
@@ -77,6 +85,7 @@ class DiarySyncEntry {
     if (isArchived) 'archived': 1,
     if (isLocked) 'locked': 1,
     if (tag != null) 'tag': tag,
+    if (sortOrder != null) 'sort_order': sortOrder,
   };
 
   static DiarySyncEntry fromJson(Map<String, dynamic> j) => DiarySyncEntry(
@@ -88,6 +97,8 @@ class DiarySyncEntry {
     isArchived: j['archived'] == 1,
     isLocked: j['locked'] == 1,
     tag: j['tag'] as String?,
+    // 老版本云端数据无此字段 → null，宽容不抛
+    sortOrder: (j['sort_order'] as num?)?.toInt(),
   );
 }
 

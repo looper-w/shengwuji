@@ -10,6 +10,13 @@ android {
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
+    // AIDL 源码编译开关（AGP 8 起默认 false）：
+    // fcitx5 输入法语音 Provider 的接口文件在 src/main/aidl/ 下，
+    // VoiceInputProviderService.kt 依赖其生成的 Stub
+    buildFeatures {
+        aidl = true
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

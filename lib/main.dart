@@ -25,6 +25,8 @@ import 'theme/app_theme_extension.dart';
 import 'theme/custom_theme.dart';
 import 'overlay/overlay_constants.dart';
 import 'utils/alarm_ringing_notifier.dart';
+import 'utils/device_diagnostics.dart';
+import 'utils/recognition_activity.dart';
 import 'utils/pro_gate.dart';
 import 'utils/tab_visibility.dart';
 import 'web_server/diary_server_controller.dart';
@@ -32,6 +34,8 @@ import 'web_server/diary_web_server.dart';
 // 保活悬浮窗入口 overlayMain：Dart 编译器只编译从 main() 可达的代码，
 // 不 import 此文件 overlayMain 就不进 kernel，引擎报 "Could not resolve main entrypoint function"
 import 'overlay/overlay_main.dart' as overlay_entry;
+// 保活 fcitx5 语音 Provider 入口 voiceProviderMain（同上道理）
+import 'voice_provider/voice_provider_entry.dart' as voice_provider_entry;
 
 /// 悬浮窗引擎入口（根库转发）。
 ///
@@ -40,6 +44,13 @@ import 'overlay/overlay_main.dart' as overlay_entry;
 /// "Could not resolve main entrypoint function"（flutter_overlay_window 官方 README 同款做法）。
 @pragma('vm:entry-point')
 void overlayMain() => overlay_entry.overlayMain();
+
+// 保活 fcitx5 语音 Provider 入口 voiceProviderMain：同 overlayMain 的道理，
+// 入口符号必须在本根库声明，否则原生层拉起的 provider 引擎找不到入口
+
+/// fcitx5 输入法外接语音识别引擎入口（根库转发，见 voice_provider_entry.dart）
+@pragma('vm:entry-point')
+void voiceProviderMain() => voice_provider_entry.voiceProviderMain();
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -56,6 +67,25 @@ void main() async {
   });
 
   sherpa_onnx.initBindings();
+
+  // 设备诊断信息记一次（品牌/型号/屏幕/导航模式/权限/已启用无障碍服务——
+  // 悬浮窗「收起后把手/竖线不出现」终端用户反馈定位用，采集口径见
+  // utils/device_diagnostics.dart；fire-and-forget 不阻塞启动）
+  unawaited(
+    DeviceDiagnosticsLogger.logOnce(
+      engine: 'main',
+      fetch: () async {
+        try {
+          final raw = await const MethodChannel(
+            'com.shengwuji.app/app',
+          ).invokeMethod('getDeviceDiagnostics');
+          return raw is Map ? raw : null;
+        } catch (_) {
+          return null;
+        }
+      },
+    ),
+  );
 
   // 预读模型路径，使 hasModel 在模型未加载时也能正确判断
   await RecognizerSingleton.preloadModelPath();
@@ -76,6 +106,12 @@ void main() async {
   }
   // 初始化全局主题 notifier，AppRoot 内的 ValueListenableBuilder 会订阅它
   AppRoot.themeNotifier.value = initialTheme;
+
+  // 预读深色模式档位（跟随系统/浅色/深色，默认跟随系统；浅色皮肤仍由
+  // themeNotifier 决定，深色模式下整树统一换 AppThemes.dark）
+  AppRoot.themeModeNotifier.value = parseThemeMode(
+    prefs.getString(kThemeModePrefKey),
+  );
 
   // 预读用户选择的字号缩放（默认 1.0 中档；旧版本无此 key 回退 1.0）
   AppRoot.fontScaleNotifier.value = prefs.getDouble('font_size_scale') ?? 1.0;
@@ -124,6 +160,13 @@ class AppRoot extends StatelessWidget {
   static final ValueNotifier<AppThemeDefinition> themeNotifier =
       ValueNotifier<AppThemeDefinition>(AppThemes.defaultTheme);
 
+  /// 全局深色模式档位（跟随系统/浅色/深色）——main() 启动时预读
+  /// `theme_mode` prefs，设置页外观区「深色模式」选择器写入后同步刷新本值
+  /// 热切换。深色模式下整树统一使用 [AppThemes.dark]，themeNotifier 选中的
+  /// 浅色皮肤在切回浅色时原样恢复
+  static final ValueNotifier<ThemeMode> themeModeNotifier =
+      ValueNotifier<ThemeMode>(ThemeMode.system);
+
   /// 全局字号缩放——任何位置都能读写
   /// main() 启动时初始化为持久化的用户选择，默认 1.0（标准）
   static final ValueNotifier<double> fontScaleNotifier = ValueNotifier<double>(
@@ -139,15 +182,23 @@ class AppRoot extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ValueListenableBuilder<AppThemeDefinition>(
-      valueListenable: themeNotifier,
-      builder: (context, themeDef, _) {
-        return ValueListenableBuilder<double>(
-          valueListenable: fontScaleNotifier,
-          builder: (context, fontScale, _) {
-            return MaterialApp(
-              title: '声物记',
-              theme: themeDef.toThemeData(),
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: themeModeNotifier,
+      builder: (context, themeMode, _) {
+        return ValueListenableBuilder<AppThemeDefinition>(
+          valueListenable: themeNotifier,
+          builder: (context, themeDef, _) {
+            return ValueListenableBuilder<double>(
+              valueListenable: fontScaleNotifier,
+              builder: (context, fontScale, _) {
+                return MaterialApp(
+                  title: '声物记',
+                  theme: themeDef.toThemeData(),
+                  // 深色模式：全 App 唯一一套深色皮肤（不进主题选择器，
+                  // 深浅切换由「深色模式」三档驱动）；themeMode=system 时
+                  // 框架跟随系统深浅自动在 theme/darkTheme 间切换
+                  darkTheme: AppThemes.dark.toThemeData(),
+                  themeMode: themeMode,
               // 强制中文本地化：UI 文案全 App 硬编码中文，日期转轮选择器
               //（悬浮窗闹钟 CalendarConfirmSheet 的 CupertinoDatePicker）等
               // 框架级文案跟随这里——不配则转轮显示英文月份/AM/PM
@@ -175,6 +226,8 @@ class AppRoot extends StatelessWidget {
                 ),
               ),
               debugShowCheckedModeBanner: false,
+                );
+              },
             );
           },
         );
@@ -238,6 +291,25 @@ class _MainScaffoldState extends State<MainScaffold>
 
   // 防止快捷方式重复触发
   bool _hasHandledShortcutLaunch = false;
+
+  // ── 退后台延迟释放识别引擎（模型内存不常驻）──
+  // 背景：主 App/悬浮窗/输入法是三个独立 engine，模型各自加载。悬浮窗
+  // （120s idle）与输入法（90s idle）早有闲置释放，主 App 那份此前加载后
+  // 永不释放——对"悬浮窗+输入法为主"的用户是纯浪费。本组字段把主 App 的
+  // 模型改为退后台 8s 后释放，回前台首次录音由各录音入口的并行预热
+  // （照抄悬浮窗 overlay_voice_memo.start：开录不等模型）把冷加载藏进
+  // 说话时间。RecognizerSingleton.dispose 会销毁 worker isolate 并重建
+  // _service，之后 initialize() 可重新加载（悬浮窗 idle 释放长期依赖此行为）。
+  bool _isAppBackgrounded = false;
+
+  /// 退后台后排定的延迟释放 Timer（resumed 取消；到点守卫不过则顺延）
+  Timer? _backgroundReleaseTimer;
+
+  /// 在途识别导致的顺延次数（上限 3 轮防死循环：超长转写 30s 后放弃本轮
+  /// 释放，等下次退后台再试）
+  int _backgroundReleasePostpones = 0;
+  static const int _backgroundReleaseDelaySeconds = 8;
+  static const int _backgroundReleaseMaxPostpones = 3;
 
   // 闹钟响铃状态（性能审查 Top5）：原生响铃开始/停止经通道推事件
   // （onAlarmRinging / onAlarmStopped，见 MainActivity.flutterChannel），
@@ -353,6 +425,7 @@ class _MainScaffoldState extends State<MainScaffold>
     DiaryWebServer.instance.remoteMutationTick.removeListener(
       _onRemoteDiaryMutation,
     );
+    _backgroundReleaseTimer?.cancel(); // 退后台释放计时随 scaffold 销毁取消
     _alarmRinging.dispose();
     _recordBarTick.dispose();
     _listButtonTick.dispose();
@@ -373,6 +446,56 @@ class _MainScaffoldState extends State<MainScaffold>
         _hasHandledShortcutLaunch = false;
       }
     }
+
+    // ── 退后台延迟释放识别引擎 ──
+    // inactive 是过渡态（通知栏下拉/权限弹窗也触发），不作触发条件也不取消
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      _isAppBackgrounded = true;
+      _scheduleBackgroundRelease();
+    } else if (state == AppLifecycleState.resumed) {
+      _isAppBackgrounded = false;
+      _backgroundReleaseTimer?.cancel();
+      _backgroundReleaseTimer = null;
+      _backgroundReleasePostpones = 0;
+    }
+  }
+
+  /// 排定退后台延迟释放：8s 后守卫通过（仍在后台 && 无在途识别 && 引擎就绪）
+  /// 才 dispose。释放后再次加载由各录音入口的并行预热负责（懒加载守卫自然兜），
+  /// 此处不主动加载。
+  void _scheduleBackgroundRelease() {
+    _backgroundReleaseTimer?.cancel();
+    _backgroundReleaseTimer = Timer(
+      const Duration(seconds: _backgroundReleaseDelaySeconds),
+      _backgroundReleaseGuard,
+    );
+  }
+
+  /// 延迟释放守卫（Timer 到点回调）：任一条件不过就取消或顺延，绝不误杀
+  void _backgroundReleaseGuard() {
+    _backgroundReleaseTimer = null;
+    if (!_isAppBackgrounded) return;
+    if (RecognitionActivity.inFlight) {
+      // 在途转写顺延：10s 后再查一轮，上限 3 轮（超长转写 30s 后放弃本轮，
+      // 等下次退后台重新计 8s——防"转写永动机"把 Timer 链拖成死循环）
+      if (_backgroundReleasePostpones < _backgroundReleaseMaxPostpones) {
+        _backgroundReleasePostpones++;
+        log(
+          '[BackgroundRelease] 在途识别未完成，顺延第 $_backgroundReleasePostpones 轮（10s 后复查）',
+        );
+        _backgroundReleaseTimer = Timer(
+          const Duration(seconds: 10),
+          _backgroundReleaseGuard,
+        );
+      } else {
+        log('[BackgroundRelease] 顺延达上限，本轮放弃释放（待下次退后台）');
+      }
+      return;
+    }
+    if (!RecognizerSingleton.instance.isReady) return; // 已释放/未加载，无事可做
+    log('[BackgroundRelease] App 退后台 ${_backgroundReleaseDelaySeconds}s，释放识别引擎内存');
+    RecognizerSingleton.instance.dispose();
   }
 
   /// 弹掉盖在 MainScaffold 上的推入路由（设置二级页、对话框）。
@@ -991,23 +1114,23 @@ class _MainScaffoldState extends State<MainScaffold>
 
     // 颜色和图标逻辑（仿日记页浮动按钮）
     // 拟物主题：底色恒为同色凸起，状态色（青/红/橙/灰）落在中心图标；
-    // 旧主题：按钮底色随状态变化，图标恒白（2026-09-23 从 ext.textOnPrimary
-    // 改回恒白：自定义主题主色偏浅时该槽按 WCAG 自动落深色，麦克风变黑，
-    // 与日记页 Colors.white 不一致）
+    // 旧主题：按钮底色随状态变化，图标走 ext.fabContentColor（浅色恒白/
+    // 深色近黑；不用 ext.textOnPrimary——自定义主题主色偏浅时该槽按 WCAG
+    // 落深色，麦克风变黑不一致，2026-09-23 教训）
     final bool isNeu = ext.isNeumorphic;
     Color btnColor = ext.fabReady; // 默认青色（旧主题=按钮底色；拟物=中心图标色）
-    Widget btnChild = Icon(Icons.mic, color: isNeu ? ext.primary : Colors.white, size: 46);
+    Widget btnChild = Icon(Icons.mic, color: isNeu ? ext.primary : ext.fabContentColor, size: 46);
 
     if (!state.isReady && !RecognizerSingleton.hasModel) {
       // 模型文件不存在 → 禁用按钮
       btnColor = ext.fabDisabled;
-      btnChild = Icon(Icons.mic, color: isNeu ? ext.textHint : Colors.white, size: 46);
+      btnChild = Icon(Icons.mic, color: isNeu ? ext.textHint : ext.fabContentColor, size: 46);
     } else if (state.isListening) {
       // 录音中 → 红色
       btnColor = ext.fabRecording;
       btnChild = Icon(
         Icons.fiber_manual_record,
-        color: isNeu ? ext.fabRecording : Colors.white,
+        color: isNeu ? ext.fabRecording : ext.fabContentColor,
         size: 46,
       );
     } else if (state.isProcessing) {
@@ -1017,7 +1140,7 @@ class _MainScaffoldState extends State<MainScaffold>
         width: 40,
         height: 40,
         child: CircularProgressIndicator(
-          color: isNeu ? ext.fabProcessing : Colors.white,
+          color: isNeu ? ext.fabProcessing : ext.fabContentColor,
           strokeWidth: 3,
         ),
       );
@@ -1059,23 +1182,10 @@ class _MainScaffoldState extends State<MainScaffold>
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
                 color: btnColor,
-                // 🎨 黏土拟态阴影（仿日记页，2026-09-23 用户反馈统一减淡：
-                // 高光固定白（自定义主题 textOnPrimary 是深色会把高光染成黑晕）、
-                // 暗影 alpha 0.2→0.12；与 diary_floating_button.dart 同款需同步）
-                boxShadow: [
-                  // 顶部高光阴影（模拟光源从上方）
-                  BoxShadow(
-                    color: Colors.white.withValues(alpha: 0.4),
-                    offset: const Offset(-4, -4),
-                    blurRadius: 8,
-                  ),
-                  // 底部深色阴影（模拟凹陷感）
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.12),
-                    offset: const Offset(4, 4),
-                    blurRadius: 10,
-                  ),
-                ],
+                // 🎨 黏土拟态阴影：ext.fabClayShadow（三处语音圆钮共用
+                // 唯一真值）——浅色=白高光+暗影；深色=仅暗影（白高光
+                // 在深底显形为光晕，2026-09-28 真机反馈）
+                boxShadow: ext.fabClayShadow,
               ),
               child: Center(child: btnChild),
             ),
@@ -1119,22 +1229,22 @@ class _MainScaffoldState extends State<MainScaffold>
 
     // 颜色/图标状态机（复现 record_tab.dart 原非搬家模式染色）
     // 拟物主题：底色恒为同色凸起，状态色（青/红/橙/灰）落在中心图标；
-    // 旧主题：按钮底色随状态变化，图标恒白（2026-09-23 从 ext.textOnPrimary
-    // 改回恒白：自定义主题主色偏浅时该槽按 WCAG 自动落深色，麦克风变黑，
-    // 与日记页 Colors.white 不一致）
+    // 旧主题：按钮底色随状态变化，图标走 ext.fabContentColor（浅色恒白/
+    // 深色近黑；不用 ext.textOnPrimary——自定义主题主色偏浅时该槽按 WCAG
+    // 落深色，麦克风变黑不一致，2026-09-23 教训）
     final bool isNeu = ext.isNeumorphic;
     Color btnColor = ext.fabReady;
-    Widget btnChild = Icon(Icons.mic, color: isNeu ? ext.primary : Colors.white, size: 55);
+    Widget btnChild = Icon(Icons.mic, color: isNeu ? ext.primary : ext.fabContentColor, size: 55);
 
     if (!state.isReady && !RecognizerSingleton.hasModel) {
       // 模型文件不存在 → 禁用按钮（灰色）
       btnColor = ext.fabDisabled;
-      btnChild = Icon(Icons.mic, color: isNeu ? ext.textHint : Colors.white, size: 55);
+      btnChild = Icon(Icons.mic, color: isNeu ? ext.textHint : ext.fabContentColor, size: 55);
     } else if (state.isListening) {
       btnColor = ext.fabRecording;
       btnChild = Icon(
         Icons.fiber_manual_record,
-        color: isNeu ? ext.fabRecording : Colors.white,
+        color: isNeu ? ext.fabRecording : ext.fabContentColor,
         size: 55,
       );
     } else if (state.isProcessing) {
@@ -1143,7 +1253,7 @@ class _MainScaffoldState extends State<MainScaffold>
         width: 45,
         height: 45,
         child: CircularProgressIndicator(
-          color: isNeu ? ext.fabProcessing : Colors.white,
+          color: isNeu ? ext.fabProcessing : ext.fabContentColor,
           strokeWidth: 3,
         ),
       );
@@ -1199,22 +1309,10 @@ class _MainScaffoldState extends State<MainScaffold>
                       duration: const Duration(milliseconds: 200),
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
-                        // 🎨 黏土拟态阴影（diary_floating_button.dart 同款，
-                        // 高光固定白 + 暗影 0.12，改动需三处同步）
-                        boxShadow: [
-                          // 顶部高光阴影（模拟光源从上方）
-                          BoxShadow(
-                            color: Colors.white.withValues(alpha: 0.4),
-                            offset: const Offset(-4, -4),
-                            blurRadius: 8,
-                          ),
-                          // 底部深色阴影（模拟凹陷感）
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.12),
-                            offset: const Offset(4, 4),
-                            blurRadius: 10,
-                          ),
-                        ],
+                        // 🎨 黏土拟态阴影：ext.fabClayShadow（三处语音圆钮共用
+                        // 唯一真值）——浅色=白高光+暗影；深色=仅暗影（白高光
+                        // 在深底显形为光晕，2026-09-28 真机反馈）
+                        boxShadow: ext.fabClayShadow,
                       ),
                       child: CircleAvatar(
                         radius: 50,
@@ -1253,7 +1351,8 @@ class _MainScaffoldState extends State<MainScaffold>
                       onPressed: state.saveData,
                       style: ElevatedButton.styleFrom(
                         backgroundColor: ext.primary,
-                        foregroundColor: ext.textOnPrimary,
+                        // 深色主题落近黑（白字在深底界面太跳），浅色恒白
+                        foregroundColor: ext.fabContentColor,
                         elevation: 0,
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(18),
@@ -1327,12 +1426,18 @@ class _MainScaffoldState extends State<MainScaffold>
       SnackBar(
         content: Row(
           children: [
-            Icon(Icons.info_outline, color: ext.textOnPrimary, size: 16),
+            Icon(Icons.info_outline, color: ext.scaffoldBackground, size: 16),
             const SizedBox(width: 8),
-            const Text('再按一次退出应用', style: TextStyle(fontSize: 12)),
+            Text(
+              '再按一次退出应用',
+              style: TextStyle(fontSize: 12, color: ext.scaffoldBackground),
+            ),
           ],
         ),
         duration: _exitPromptTimeout,
+        // 背景=textPrimary（浅色主题深底/深色主题浅底），图标文字取对面的
+        // scaffoldBackground——深色主题下白 87% 底配白图标/默认白字不可读
+        //（2026-09-28 深色适配顺带修复）
         backgroundColor: ext.textPrimary,
         behavior: SnackBarBehavior.floating,
         margin: EdgeInsets.fromLTRB(

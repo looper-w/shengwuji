@@ -92,20 +92,21 @@ class _DiaryFloatingButtonState extends State<DiaryFloatingButton> {
 
     // 颜色和图标逻辑
     // 拟物主题：底色恒为同色凸起，状态色（青/红/橙/灰）落在中心图标；
-    // 旧主题：按钮底色随状态变化，图标恒白
+    // 旧主题：按钮底色随状态变化，图标走 ext.fabContentColor（浅色恒白/
+    // 深色近黑，2026-09-28 深色模式反馈白图标太跳）
     final bool isNeu = ext.isNeumorphic;
     Color btnColor = ext.fabReady;
-    Widget btnChild = Icon(Icons.mic, color: isNeu ? ext.primary : Colors.white, size: 46);
+    Widget btnChild = Icon(Icons.mic, color: isNeu ? ext.primary : ext.fabContentColor, size: 46);
 
     if (!widget.isReady && !widget.modelAvailable) {
       // 模型文件不存在 → 禁用按钮
       btnColor = ext.fabDisabled;
-      btnChild = Icon(Icons.mic, color: isNeu ? ext.textHint : Colors.white, size: 46);
+      btnChild = Icon(Icons.mic, color: isNeu ? ext.textHint : ext.fabContentColor, size: 46);
     } else if (widget.isListening) {
       btnColor = ext.fabRecording;
       btnChild = Icon(
         Icons.fiber_manual_record,
-        color: isNeu ? ext.fabRecording : Colors.white,
+        color: isNeu ? ext.fabRecording : ext.fabContentColor,
         size: 46,
       );
     } else if (widget.isProcessing) {
@@ -114,7 +115,7 @@ class _DiaryFloatingButtonState extends State<DiaryFloatingButton> {
         width: 40,
         height: 40,
         child: CircularProgressIndicator(
-          color: isNeu ? ext.fabProcessing : Colors.white,
+          color: isNeu ? ext.fabProcessing : ext.fabContentColor,
           strokeWidth: 3,
         ),
       );
@@ -123,7 +124,7 @@ class _DiaryFloatingButtonState extends State<DiaryFloatingButton> {
       // 滑动提示由上滑拉出的「↑ Aa」徽章承担（见 _buildAaBadge）；下滑暂无功能，不做对称提示以免误导。
       // ⚠️ 本按钮位于 Scaffold 外层 Stack（无 Material 祖先），Text 若不给完整样式会
       // fallback 到黄色双下划线警示样式（_buildAaBadge 已按此防护）
-      btnChild = Icon(Icons.mic, color: isNeu ? ext.primary : Colors.white, size: 46);
+      btnChild = Icon(Icons.mic, color: isNeu ? ext.primary : ext.fabContentColor, size: 46);
     }
 
     return Positioned(
@@ -243,27 +244,10 @@ class _DiaryFloatingButtonState extends State<DiaryFloatingButton> {
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
                         color: btnColor,
-                        // 🎨 黏土拟态阴影：顶部高光 + 底部深色阴影
-                        // 2026-09-23 用户反馈（自定义主题下三页语音钮不一致）：
-                        // 高光原用 ext.textOnPrimary，自定义主题主色偏浅时该槽
-                        // 按 WCAG 自动落深色（L=0.13），「高光」变黑晕、整体显得
-                        // 阴影过重 → 高光固定白色；暗影 alpha 0.2→0.12 减淡。
-                        // ⚠️ 三处语音圆钮阴影保持一致（main.dart 查物品浮动钮/
-                        // 录入页钉底栏同款），改动必须三处同步
-                        boxShadow: [
-                          // 顶部高光阴影（模拟光源从上方）
-                          BoxShadow(
-                            color: Colors.white.withValues(alpha: 0.4),
-                            offset: const Offset(-4, -4),
-                            blurRadius: 8,
-                          ),
-                          // 底部深色阴影（模拟凹陷感）
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.12),
-                            offset: const Offset(4, 4),
-                            blurRadius: 10,
-                          ),
-                        ],
+                        // 🎨 黏土拟态阴影：ext.fabClayShadow（三处语音圆钮共用
+                        // 唯一真值）——浅色=白高光+暗影；深色=仅暗影（白高光
+                        // 在深底显形为光晕，2026-09-28 真机反馈）
+                        boxShadow: ext.fabClayShadow,
                       ),
                       child: GestureDetector(
                         // 内层：保留原有 onTap / onLongPressStart / onLongPressEnd

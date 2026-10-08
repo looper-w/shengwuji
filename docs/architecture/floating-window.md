@@ -42,6 +42,27 @@
 | （2026-09-22 本次提交） | 息屏自动隐藏悬浮窗（AOD 防残留，用户反馈"录完音不管它，息屏后把手/竖线跟着息屏时钟一直杵在 AOD 上"）：复用锁屏即重锁的 ACTION_SCREEN_OFF receiver（IntentFilter 追加 ACTION_SCREEN_ON，同 receiver 兼管两态），SCREEN_OFF 时窗口 visibility=GONE、SCREEN_ON 恢复 VISIBLE + engine 手动 appIsResumed 兜底——ACTION_SCREEN_OFF 在息屏时刻即发出（AOD 属非交互态），「屏幕变黑」与「进入 AOD」都被覆盖，无需专门 AOD 检测 API；选 GONE 而非 hideOverlay 移窗：窗口/Dart engine/录音转写链路/自动隐藏计时全保留，亮屏各形态（把手/竖线/胶囊/面板）原样回归、Dart 全程无感知，且与 alpha（隐藏窗揭示期 0 / 认证让位 0.15）正交不泄露未揭示窗口；`overlayHiddenByScreenOff` 标志限定 SCREEN_ON 只撤销"因息屏而 GONE"的隐藏；录音中息屏录音不中断；Kotlin 单文件改动，Dart 零改动，compileDebugKotlin 通过 + flutter analyze 0 error + flutter test 全过；详见"息屏自动隐藏（AOD 防残留）"小节 |
 | （2026-09-22 本次提交） | 息屏收起到驻留终态（真机用后升级诉求"亮屏后把手/面板也不该恢复"→用户拍板语义「进 AOD 必须收」）：SCREEN_OFF 在 GONE 之外追加发 screenAutoHide（dartReady && !proHintActive 守卫）→ Dart OverlayHome._onScreenAutoHide 立即收起——竖线开关开 → _enterEdgeLine 缩成贴边竖线、关 → closeOverlay 彻底移除，此后亮屏/解锁只会看到竖线（或录音中的胶囊），把手/面板不复活；「永久」档息屏不生效（只管亮屏常驻）；跳终态不走 _collapse 推屏动画——息屏后窗口 GONE、vsync 停、AnimationController 不跑，等 dismissed 回调会卡到亮屏，黑屏下空白帧协议天然满足，_enterEdgeLine 的 awaitingResize 守卫照挂、亮屏后首个 build 由 _maybeAdvanceMetricsStage 解除竖线淡入；守卫：录音/转写中跳过（活动会话不打断）、编辑中先 _saveEdit（失败留编辑态不丢输入，同 _openDiaryPage 先例）、先作废挂起的自动隐藏 Timer；SCREEN_ON 恢复 VISIBLE 保留（竖线显示的前提）+ overlayHiddenByScreenOff 标志/appIsResumed 兜底不变；flutter analyze 0 error（142 info 含新增 2 处 print）+ 585 测试全过 + compileDebugKotlin 通过；详见"息屏自动隐藏（AOD 防残留，2026-09-22 两轮）"小节 |
 | （2026-09-22 本次提交） | 标注三色按钮上提时间行一级直出 + 时间格式改横杠（用户需求：标注在二级菜单操作太深，时间行右侧有空隙）：①展开卡时间文本后紧凑直出 ❗⭐💡 三按钮（`_buildInlineTagButton` 32×32 命中区相邻不加间距、选中白底圆 24+标注色图标 15，未选中白图标 17）——替代首版「底条标注入口 label_outline → 底行整行替换 ❗⭐💡✗」两步交互，二级菜单机制整体删除（`isTagPicking`/`onTagEntry`/`onTagPickCancel`/`_tagPickingIds` 及 6 处清理挂点，`_setDiaryTag` 去退出选择态分支）；②时间格式 `yyyy年M月d日 HH:mm` → `yyyy-MM-dd HH:mm`（省时间行横向空间给按钮组）；③时间行布局 Expanded(Text) → Text+按钮组+Spacer+chevron（按钮紧贴时间，空隙全给 chevron 前）；命中区 32=时间行高不撑高卡片（`_estimateExpandedHeight` timeRowH 条件补 onTagToggle）；Kotlin 零改动；flutter analyze 0 error + 585 测试全过（标注测试改写为时间行直出断言 + 新增横杠时间格式断言）；详见"卡片标注"小节 |
+| （2026-09-27 本次提交） | 面板字体大小五档（用户需求：以现字号为基准 ±2 档）：设置页悬浮窗二级页「字体大小」ChoiceChip 特小/小/标准/大/特大，prefs `overlay_font_size_step`（int 档位 -2~+2，`parseFontSizeStep` clamp 连续刻度语义——与把手大小的白名单语义不同），每档 1pt（0.5pt 档差真机不可辨、2pt 档差最小档跌破可读下限）；**作用范围只限日记面板文字**（卡片收起/展开/编辑/删除确认 + 已归档分隔线/空态/错误态）——把手有独立大小档位（叠加会双重缩放）、语音速记胶囊宽度预算按 15 号字调过、提示胶囊是转瞬 UI，三者均不缩放；读取方 `_refreshOverlayConfig`/`_scheduleAutoHide`（跨 engine reload 惯例，下一次状态转换生效，同把手大小心智）；⚠️ 收起态文字测量缓存 key 必须含字号（不同档位同文本宽度不同，不进 key 会串档，估算偏窄把短文字顶出省略号——046fe0b 同类坑）；查看态勾选框反缩放倍率须用缩放后字号（框架按 textScaler.scale(实际字号)/实际字号 放大，用基准值反缩放会二次偏差）；渲染与三处 painter 测量（收起宽度/展开高度/点击偏移换算）同源 `_fs()` 缩放；设置页选择器 avatar Aa 图标大小随档位递减/递增直观预览；Kotlin 零改动；新增 overlay_font_size_test 7 例（parse clamp/默认 + fontScaled + 缓存分档），flutter analyze 0 error + 632 测试全过；详见"面板字体大小档位"小节 |
+| （2026-09-27 本次提交） | 硬不变量高度误判根治（Redmi miro 450dpi 真机反馈「收起后把手永不出现、点竖线后消失」，渲染分支日志实锤）：Kotlin dpToPx 截断取整 → density 2.8125 下把手窗 88dp=247.5px 截 247 → Flutter 实测 87.8 < 88，旧判定 `maxHeight < handleHeight` 把把手窗误判为胶囊高度档渲染空白（440dpi 等密度整除设备不触发故开发侧不可复现）；修复双保险——①Dart 判定改纯函数 `OverlayConstants.isCapsuleHeightWindow`，阈值取两设计高度中点 86（取整误差恒 <1px≤1dp，把手窗实测最低 ≈87.0/胶囊窗实测最高 ≈84.5，任意密度不踩界）；②Kotlin dpToPx(Int) 截断改四舍五入（roundToInt，88.18 实测回到 ≥88）；新增 overlay_window_height_threshold_test 4 例；flutter analyze 0 error + 测试全过 + compileDebugKotlin 通过；详见"冷启动隐藏窗口"下「硬不变量高度误判」小节 |
+| （2026-09-28 本次提交） | 展开面板态 toggle 隐藏后再召唤只出胶囊根治（用户反馈「双击音量减显示悬浮窗，再双击消失，第三次双击出来是胶囊」）：根因 = `_lastWindowConstraints`（resize 落地检测基准）跨窗口会话陈旧——展开面板态被 toggle 隐藏时窗口以全屏尺寸移除，基准停在全屏；下次 showOverlay 以 28×88 重建后，`_expand` 的 setState(awaitingResize) 若先于首帧 build 执行（prefs reload 的 await 通常让首帧先跑则幸免，时序竞态），首帧 28×88 ≠ 陈旧全屏基准被 `_maybeAdvanceMetricsStage` 误判「resize 已落地」提前摘守卫并启动滑入 → `_waitForBlankFramePresented` 续段见 stage 已非 awaitingResize 直接中断 → `controller.expand()` 永不调用，窗口卡死把手尺寸。与揭示门「基准约束跨会话陈旧」（64b1c09）同款病理。自动隐藏路径不触发（收起态 28×88 时移除，基准恰好正确）；冷启动首次召唤不触发（基准 null 有 `last == null → return` 保护）——故仅「展开面板态 toggle 隐藏 → 再显示」一条路径中招。修复：`_resetFromNative` 补 `_lastWindowConstraints = null`（窗口移除即基准作废，下个会话首帧 `last==null` 天然不误判）；Dart 单文件改动，Kotlin 零改动；flutter analyze 0 error 且 issue 数 126 与基线持平、flutter test 656 全过 |
+| （2026-09-28 本次提交） | 滑动直接删除 + 3 秒撤销（用户需求：划走归档改为可选删除，归档入口由卡片顶端圆圈保留）：设置页悬浮窗二级页新增「滑动操作」区开关「滑动直接删除笔记」（prefs `overlay_swipe_delete_enabled`，默认关=历史划走归档，同走 Pro 门禁）；开启后活跃卡划走直接删除——`_onCardSwipeDismissed` 划走回调里现场 reload 读开关（动作型开关同 `_onEdgeLineTap` 模式，即时生效）分流到 `_swipeDeleteWithUndo`：**真删库行**（墓碑由 DbHelper.deleteDiary 内置记录）+ 面板 header 下方浮现黑 72% 撤销胶囊（`UndoDeletePill`，OverlayPanelHeader 同视觉家族），`swipeDeleteUndoWindow`=3s 内点「撤销」把行全字段原样插回（`DbHelper.restoreDeletedDiary`：sync_uuid 保留跨端身份不变 + 墓碑清除防云端同 uuid 条目永不拉回，本地自增 id 重新分配、排序键 created_at 未变故卡片回到原位置）；**录音文件延迟到窗口到期才补删**（窗口内音频在盘上，撤销才能连录音一起还原）；单槽位——再次滑删/面板收起/窗口移除/dispose 都先让前一个删除落定（补删其录音）；已归档卡划走=删除的既有路径不受影响；锁定打码卡在开关开启时同样走删除语义门禁；新增 db_restore_deleted_diary_test（真删→恢复全字段+墓碑清除）与 undo_delete_pill_test 2 例；flutter analyze 0 error（+10 info 均为同款 print）+ flutter test 659 全过 |
+| （2026-09-28 本次提交） | 「永久」档把手息屏解锁后消失根治（用户反馈「唤醒胶囊后息屏再解锁，胶囊和侧滑条都没了」，log2 实锤）：根因 = 09-22「进 AOD 必须收」语义**无条件**推进驻留终态且永久档不豁免——用户配置永久档+竖线开关关，息屏即走 closeOverlay 彻底移除，与「永久=把手一直在」的字面承诺正面冲突；用户拍板新语义「永久档穿越息屏」：`_onScreenAutoHide` 分流改走纯函数 `OverlayConstants.screenOffActionFor`（唯一权威）——永久档 → keepHandle（展开面板仍先无条件跳终态收回把手，面板永不穿越息屏；息屏期间仅由 Kotlin GONE 保 AOD 干净，亮屏 VISIBLE 把手原样回来，竖线开关在永久档下对息屏不生效），限时档维持「进 AOD 必须收」（竖线开→竖线/关→移除）不变；Dart 改动（分流纯函数 + overlay_home 接线），Kotlin 零改动；新增 overlay_screen_off_action_test 4 例；flutter analyze 0 error + flutter test 663 全过（659 基线+4 新增）；详见「息屏自动隐藏（AOD 防残留）」小节第三轮 |
+| （2026-09-29 本次提交） | 竖线距屏幕边缘间距三档（用户反馈：贴带黑边的钢化膜后完全贴边的竖线被膜边遮住看不见，对比小米系统侧边栏有内移边距）：设置页悬浮窗二级页「贴边竖线」卡新增「距屏幕边缘间距」ChoiceChip 贴边（0，缺省=历史行为）/ 内移（4）/ 最里（8——首版 0/8/16 的 16 档用户实测内移过多，整体下调为 0/4/8，旧档位 16 落盘值按非法值兜底回 0），prefs `overlay_edge_line_margin_dp`（int，白名单解析非法值兜底 0）；**纯 Dart 视觉内移**（同把手大小「只缩视觉不缩窗口」思路）——窗口 20×64 与透明触摸缓冲区不动，竖线在窗口内经 `edgeLinePadding` 纯函数向屏内侧偏移，窗口内硬上限 16 = 窗口宽 20 − 线宽 4（⚠️ 不靠加宽窗口换更大间距：窗口宽 >24 会撞 Kotlin `EDGE_LINE_WIDTH_THRESHOLD_DP`=24 线态判定）；读取方 `_refreshOverlayConfig`/`_scheduleAutoHide`（跨 engine reload 惯例，下一次状态转换生效，已驻留竖线不瞬移），随停靠侧镜像；同走 Pro 门禁；Kotlin 零改动；新增 overlay_edge_line_margin_test 3 例（parse 兜底/padding 方向镜像/「最大档+线宽≤窗口宽」不变量），flutter analyze 0 error + 666 测试全过（663 基线+3 新增） |
+| （2026-09-29 本次提交） | 滑动删除撤销胶囊贴停靠缘（用户反馈：停靠右缘左滑删除时撤销提示出现在屏幕中部，单手够不着「撤销」）——首版 `UndoDeletePill` 裸放在面板 Column（crossAxisAlignment.start）里，停靠右缘时胶囊贴面板左端=屏幕中部，停靠左缘恰好贴边，两侧不一致；修复：`UndoDeletePill` 新增 `dockLeft` 参数（overlay_home 传 `_sideLeft`），内部包 `Align(dockLeft ? centerLeft : centerRight)`——Align 在面板宽度约束内撑满、Row.min 收缩到内容宽，胶囊贴停靠缘拇指区，与 OverlayPanelHeader/录音胶囊同款镜像规则；undo_delete_pill_test 补两侧 Align 断言（3 例全过），flutter analyze 0 error |
+| （2026-09-29 本次提交） | 展开面板态 toggle 隐藏后再召唤只出胶囊**二次根治**（8a2c216 修复后真机复现「还是不行」，日志实锤）：8a2c216 在 `_resetFromNative` 清 `_lastWindowConstraints = null`，但随后 `_controller.collapse()` 触发的尾帧 build 照常跑 `_maybeAdvanceMetricsStage`——此刻窗口已移除而 FlutterView metrics 仍停在移除前全屏尺寸，**null 刚清空就被同会话尾帧重新记回陈旧全屏基准**，下个会话首帧（28×88）≠ 陈旧基准又被误判「resize 已落地」提前摘守卫，同一卡死路径复现。修复：新增 `_windowRemoved` 标记——`_resetFromNative` 置位（唯一置位方），置位期间 `_maybeAdvanceMetricsStage` 直接 return 不记基准；复位点 = onExpand / onStartVoiceMemo / _onNewNote / onShowProLockedHint 四个 handler（已核对 Kotlin `showOverlay` 全部 5 个调用点都紧随这四个消息之一，即「新窗口会话开始」的 Dart 侧权威信号；⚠️ 不能在 `_expand` 里复位——转写完成于窗口移除后时 `_onVoiceMemoChanged` 也调 `_expand`，在那复位会重新打开污染窗口）。Dart 单文件改动，Kotlin 零改动；flutter analyze 0 error（136 issue 与基线持平）、flutter test 663 全过 |
+| （2026-09-29 本次提交） | **卡片长按拖动排序**（用户需求：悬浮窗可以长按调节顺序，长按震动反馈，调节时其余卡片对应移动让开，仅限未展开的可长按；方案拍板 B：顺序持久化到 diary 表 sort_order 列，主 App/电脑访问全跟随）：①DB v15→v16 加 `sort_order`（仅活跃区有意义、越小越靠前、归档区恒 NULL——归档即清空/恢复回顶部/新插入置顶 min-1/撤销删除恢复原值），getDiaries 排序 `is_archived ASC, (sort_order IS NULL) ASC, sort_order ASC, created_at DESC`——漏网 NULL 行排活跃区尾部时间倒序兜底（忘赋值无害，首次重排即规范化），主 App 日记页/电脑访问服务读同一 SQL 零改动自动跟随；升级事务只做 DDL，存量回填首开幂等执行（⚠️ 迭代方向必须 created_at ASC，DESC 会把顺序整个颠倒，防再犯注释在 db_helper.dart）；②悬浮窗 UI：列表换 `ReorderableListView.builder`（`buildDefaultDragHandles: false` + 活跃+收起+非编辑中卡片条件包 `ReorderableDelayedDragStartListener`），拖起瞬间 `onReorderStart` → `performHaptic('tick')`，proxyDecorator 用 `Material(type: transparency)`（透明面板禁默认 elevation 白底浮层，既有教训），落点 clamp 与内存重排收纯函数 `reorderActiveItems`（拖到归档区位置=落活跃区末尾，归档区/分隔线不动）；内存先行 setState → `reorderActiveDiaries` 事务规范重写 0..n-1 → `DiarySyncBridge.bump()` 主 App 感知，失败回库恢复真相（照 _setDiaryTag 模式）；③周边：备份 CSV 第 8 列「排序」（放最后旧 App 兼容）、云同步 DiaryPayload 带 sortOrder 编解码宽容（下载插入空活跃区尊重远端值/非空堆顶部，两端各自重排不互相覆盖）、web server 聚合签名追加 `SUM(sort_order * id)` 加权和（纯 SUM 对 0..n-1 重排恒不变会漏检）；新增 overlay_diary_reorder_test 10 例 + db_sort_order_test 七阶段 + db_upgrade_v16_test；flutter analyze 0 error、flutter test 680 全过；详见「卡片长按拖动排序」小节 |
+| （2026-10-06 本次提交） | **面板高度（可见条数档位）**（用户需求：大屏手机单手拿时，面板顶部的新建/展开按钮在屏幕上方够不着）：设置页悬浮窗二级页「字体大小」后新增「面板高度」ChoiceChip 10/9/8/7/6 条五档（默认 10 = 历史行为），prefs `overlay_panel_max_cards`（int 6~10，`parsePanelMaxCards` clamp 连续刻度语义同 fontSizeStep），单位用条数（用户拍板，比高/中/低档位直观）；**关键设计：面板是顶部锚定布局，只缩列表限高只会让底边上移、顶部按钮原地不动**——必须同时给面板顶部加等量下压偏移（`panelTopOffsetFor` = (默认档−当前档)×一张卡高，Padding 包在面板 Align child 外层），才兑现用户描述的「满列表整列底边位置不变、顶部按钮组下移进拇指区」；设计不变量 `panelTopOffsetFor(n) + panelListMaxHeightFor(n)` 为定值（测试钉住）；列表限高 `panelListMaxHeightFor(_panelMaxCards)` 替代旧常量直引（默认档结果 == panelListMaxHeight，测试钉住）；Padding 在 Align 约束内缩小可用高度，Column Flexible 列表仍被窗口剩余高度约束、矮屏不溢出；读取方 `_refreshOverlayConfig`/`_scheduleAutoHide`（跨 engine reload 惯例，下一次状态转换生效，已展开面板不瞬移），同走 Pro 门禁；设置页选择器 avatar 列表图标大小随条数递减直观预览；Kotlin 零改动；新增 overlay_panel_height_test 8 例（parse clamp/默认 + 限高递减档差 + 偏移 + 底边不变不变量 + 最低档可滚动），flutter analyze 0 error（print info 与基线同款）+ flutter test 688 全过（680 基线+8 新增）；详见「面板高度（可见条数档位）」小节 |
+| （2026-10-06 本次提交） | **大爆炸分词层**（用户需求：展开卡正文长按 → 锤子 Big Bang 式全屏分词窗口，词块点选 + **滑动连选首期就要做** + 一键复制；全屏视觉而非底部弹层，用户拍板）：①入口 = 展开卡查看态正文长按（`onLongPressText`），空内容占位行/锁定打码卡不传（明文不出卡片，同 AI 对话门禁）；⚠️ 正文点按进编辑从 `onTapDown` 改 `onTapUp`——down 触发会抢在长按压住之前先进编辑态，两个回调靠手势竞技场分流的前提是 tap 等抬起；②分词复用修正对体系的 dart_jieba（`BigBangTokenizer`，词典 assets/jieba_dict.dgz 运行时拷贝），**overlay isolate 独立懒加载**（static 缓存不跨 isolate，主 engine 经 ContextCorrector 加载过的对本 isolate 无效——FFI 绑定同款铁律），jieba 失败回退字符级切分（CJK 逐字 + ASCII 归并），功能永不缺席；③手势模型：词块 onTap toggle + 外层 Listener（不抢竞技场）按下记锚点、位移超 kTouchSlop 才进连选（未超松手 = tap 照常 toggle）、锚点→当前命中区间整体置选；按下落在词块上时 physics 换 NeverScrollable 锁滚动（防边选边滚），空白/标点区按下不锁照常滚动；词块 Rect 相对词块区容器缓存（同坐标系随滚动平移不失效），命中经 globalToLocal 换算；④标点/空白降级渲染不可选但保留在序列——`joinSelected` 区间拼接把夹在选中词之间的原文带出（"苹果，牛奶 bread"），跳过可选词 = 跳跃点选直接首尾相接；⑤复制走原生 `copyText` 通道（自带 EFFECT_TICK + 剪贴板）成功后关层；选择变化/长按唤起 tick 震动 40ms 节流（AI 对话按钮同款线性马达家族）；层压在 `_buildPanel` Stack 最上层（窗口本就全屏无需 resize），`_collapse`/`_resetFromNative` 同步清零；新增 big_bang_tokenizer_test 10 例 + big_bang_layer_test 7 例（含滑动连选单 moveTo 一步铺满区间、短按落回 toggle），flutter analyze 0 error + flutter test 706 全过（689 基线+17 新增）；详见「大爆炸分词层」小节 |
+| （2026-10-06 本次提交） | **大爆炸两处真机反馈修复**：①**二次滑选覆盖旧选根治**（用户反馈：开头滑选 3 个词后再到末尾滑选追加，开头的选中态丢失只剩末尾 3 个）——根因 = `_applyRange` 每轮 clear 重建 `_selected`，新一次滑选把旧选整个替换；修复 = 追加语义：本轮起步快照已有选择为基线 `_dragBase`，区间与基线取并集（松手后再次滑选/点选是追加而非覆盖），同一轮内拖回缩小区间只影响本轮新增部分；②**UTF-16 异常刷屏根治**（logcat 反复 `Invalid argument(s): string is not well-formed UTF-16`）——根因 = dart_jieba 按 UTF-16 code unit 切分，emoji 代理对被劈成高代理+低代理两个孤立 token，Text 渲染孤立代理直接抛（临时测试实锤：`测试😀一下` 切出 `d83d`/`de00` 两个单码元碎片）；修复 = `fromRawTokens` 按代理对完整性把相邻碎片并回完整字符再判可选性，"拼接==原文"不变量保持；新增 4 测试（两次滑选追加、点选+滑选混合追加、emoji 碎片合并×2），flutter analyze 0 error + flutter test 710 全过（706 基线+4 新增） |
+| （2026-10-06 本次提交） | **大爆炸层高度对齐面板 header 顶**（用户反馈：全屏弹窗太高、单手够不着顶栏）——层顶边从窗口顶下移到面板 header（新增按钮所在工具条）上缘，新增 `BigBangLayer.topInset` = 状态栏固定避让（新常量 `panelHeaderTopPadding`=40，与 `_buildHeader` 同源，旧硬编码 40 双处归一）+ 面板高度档下压偏移（`panelTopOffsetFor(_panelMaxCards)`）——**随设置页「面板高度」档位联动**：档位越低层顶边越低，默认 10 档 inset=40 与旧行为一致零变化；顶边上方改透明留白（透出下层应用画面，视觉上层不再撑满全屏），留白区 opaque 命中 + onTap 就地吸收触摸（底层是面板空白区收起手势，穿透会把面板连同本层一起收掉）；层内顶部 40 避让移除（改由留白承担）、底部 48 避让不变；新增 topInset 测试 1 例，flutter analyze 0 error + flutter test 711 全过（710 基线+1 新增）；详见「大爆炸分词层」小节 |
+| （2026-10-06 本次提交） | **大爆炸跳跃选择交界丢空格修复**（用户反馈：第一次滑选英文词组内部空格正常，追加第二次滑选后两段交界粘词——`touch and holdafter two hours`）：根因 = `joinSelected` 的跳跃间断（中间隔着被跳过的可选词）一律直接首尾相接，间断区两端紧贴的空白也被丢掉；修复 = 间断区原文仍不带出（跳跃语义不变），但间断区首/尾 token 是空白时交界补一个空格——英文词间空格保留，中文跳跃点选边界本无空格行为不变（`苹果，香蕉，牛奶` 跳选仍得 `苹果牛奶`）；旧用例 `苹果，牛奶 bread` 跳选 {0,4} 期望相应从 `苹果bread` 改为 `苹果 bread`（间断区尾部空格被保留，更忠实原文）；新增 2 测试（英文两次滑选交界不粘词、中文间断无空白仍首尾相接）+ 2 旧例改期望，flutter analyze 0 error + flutter test 713 全过（711 基线+2 新增） |
+| （2026-10-06 本次提交） | **大爆炸底栏新增搜索按钮**（用户需求：分词窗口底部加搜索按钮打开浏览器搜索选中文字，浏览器在设置页选择、未设置用系统默认；用户拍板搜索引擎也可选）：底栏预览与复制之间插入搜索按钮（`onSearch` 可空参数 null 不渲染，旧测试零影响），`joinSelected` 拼接 → `buildSearchUrl`（新文件 `lib/utils/big_bang_search.dart`：百度/必应/Google 注册表 + prefs 读取，reload 跨 engine 惯例）→ 新增原生 `openUrl` 通道方法（`ACTION_VIEW` + 可选 `setPackage` 指定浏览器，`ActivityNotFoundException` 回落系统默认；overlay/MainActivity 两条通道各一份，overlay 侧 `FLAG_ACTIVITY_NEW_TASK`）；设置页新增「大爆炸搜索」二级页（引擎 ChoiceChip + 浏览器单选列表，浏览器枚举走新增 `getInstalledBrowsers`——`queryIntentActivities(ACTION_VIEW, https)` 只列真浏览器，图标懒加载复用 `getAppIcon`，主页入口行副标题「引擎 · 浏览器」），prefs `search_engine`/`search_browser_package`/`search_browser_name`；新增 big_bang_search_test 10 例 + big_bang_layer_test 4 例（搜索透出拼接文本/无选中禁用/null 不渲染/失败不关层）+ search_settings_page_test 4 例，flutter analyze 0 error + flutter test 全过 + compileDebugKotlin 通过；详见「大爆炸分词层」生命周期与复制小节 |
+| （2026-10-06 本次提交） | **大爆炸「二次爆炸」**（用户需求：jieba 切分不合心意——如「app叫声物记」切成【app、叫声、物记】，想要单字粒度挑选；按钮位置用户拍板底栏，不做选中词上方浮出气泡）：底栏预览与搜索之间新增刀图标按钮（`Icons.content_cut` + Tooltip「再炸成单字」，锤子原版同款位置语义），点击把**选中词块**就地炸成单字（中文逐字、英文逐字母，emoji 不劈代理对——`explodeToChars` 逐 rune 切，与 `charSplit` 的「连续 ASCII 归并」回退链语义刻意分开）；炸出的单字**保持选中**（直接复制/搜索，或点掉多余单字逐字微调）；选中全是单字/无选中/分词中时按钮禁用（`_canExplode` 幂等）；不做撤销（爆炸是追加式变换，重炸成本仅一次长按）；⚠️ tokens 更换后旧 index 的命中 Rect 全部失效——`_prepareKeys` 同步清 `_rects`（setState 到 postFrame 重缓存之间 `_hitToken` 会拿旧 Rect 命中新词块）；tokenizer 新增 6 例 + layer 新增 8 例（含爆炸后滑选命中新单字词块的 Rect 重建回归），flutter analyze 0 error + flutter test 744 全过（730 基线+14 新增）；详见「大爆炸分词层」分词/生命周期与复制小节 |
+| （2026-10-07 本次提交） | **大爆炸层降高 + 词块区纵向居中**（用户两条反馈：主 App 大爆炸弹窗还是全屏单手不好操作、层内文字不要从上往下要纵向居中；两侧都要居中）：①主 App 层顶边从「状态栏高度避让」改为按悬浮窗「面板高度」**8 条档位**的顶部高度取值——新常量 `OverlayConstants.bigBangMainAppTopInset` = panelHeaderTopPadding(40) + panelTopOffsetFor(8) = 152dp（`bigBangMainAppRefCards`=8 唯一真值，测试钉死数值），主 App 无档位设置项固定参照 8 条档；②词块区纵向居中收在共用组件 `BigBangLayer._buildTokenArea` 一处（主 App/悬浮窗同时生效）——`LayoutBuilder` 取视口高 → `ConstrainedBox(minHeight: 视口高−24)`（扣 ScrollView 上下 padding 12×2，矮视口 clamp 0）→ `Center` 包词块 Wrap：Center 在无界高度下收缩到内容、被 minHeight 钳到视口高，短内容居中、长内容超高时居中自然退化为可滚动；命中 Rect 相对 `_areaKey` 缓存不受影响（同坐标系随滚动平移）；新增常量测试 1 例（overlay_panel_height_test）+ 居中 widget 测试 1 例（词块中心 ≈ 词块区视口中心 ±30），flutter analyze 0 error + flutter test 746 全过（744 基线+2 新增） |
+| （2026-10-07 本次提交） | **大爆炸层底部改透明关闭条**（用户反馈：复制按钮下方的 48dp 深色条带「完全盖住」底部，希望加关闭按钮让单手大拇指可关层，或者改透明点击关闭——两个方案合并实现）：底部 48dp 深色避让条带移出 Material 改 `_buildCloseStrip()`——**透明透出下层画面**（主 App 透出日记页 / overlay 透出底层应用）+ **整条点击即关闭** + 中间一枚 ✕ 圆形按钮（黑 55% 底白图标，深浅背景都可见）作视觉落点；视觉透明但 `HitTestBehavior.opaque` 吸收触摸——overlay 侧穿透会命中面板空白区收起手势把面板连同本层一起收掉，主 App 侧穿透会点到下层日记卡；高度 48 沿用原底部避让惯例（FLAG_LAYOUT_NO_LIMITS 拿不到 insets）；⚠️ 顺带修复顶部留白命中失效：`SizedBox` 只给高度在 Column（交叉轴默认 center）里收缩到 0 宽，「吸收触摸」形同虚设——补 `width: double.infinity`；关闭条 widget 测试 2 例（条带非按钮区点击关闭 / ✕ 按钮点击关闭），flutter analyze 0 error + flutter test 748 全过（746 基线+2 新增）；详见「大爆炸分词层」生命周期与复制小节 |
+| （2026-10-07 本次提交） | **大爆炸层四角圆弧化**（用户需求：分词弹窗四周边缘做圆弧化处理，随手记/悬浮窗两侧都要）——收在共用组件 `BigBangLayer.build` 一处两侧同时生效：新常量 `OverlayConstants.bigBangCornerRadius`=20dp，深色主体 Material 加 `borderRadius` + `clipBehavior: Clip.antiAlias`（Material 的 borderRadius 只影响背景形状，子内容须显式 clip 才随圆角裁切），圆角缺口透出下层画面，与顶部透明留白/底部透明关闭条同一「层不撑满全屏」视觉语言；⚠️ 缺口区域外包 `GestureDetector(opaque, onTap:(){})` 吸收触摸——裁切外的角落若不接住，overlay 侧穿透会命中面板空白区收起手势（把面板连同本层一起收掉）、主 App 侧（opaque:false 路由无 barrier）穿透会点到下层日记卡；两个调用方 overlay_home/diary_tab 零改动；新增圆角 widget 测试 1 例（Material borderRadius/clipBehavior + 常量数值钉死），flutter analyze 0 error + flutter test 749 全过（748 基线+1 新增）；详见「大爆炸分词层」小节首段 |
+| （2026-10-07 本次提交） | **大爆炸滑动取消**（用户需求：在已连选的词块上滑动应取消选择，对齐锤子原版——此前滑动只能追加不能取消）：连选模式由**锚点词块的选中态**决定——起步时锚点已选中 → 本轮为「滑动取消」（`_dragDeselect`），锚点→当前命中区间从基线 `_dragBase` 中剔除而非并集；锚点未选中 → 维持追加置选不变（第二轮滑选不丢旧选的既有语义不受影响，追加轮经过已选词块也不误剔——模式只看锚点）；同一轮内拖回缩小区间可恢复（基线不动，只影响本轮划到的范围），取消后新一轮在已取消词块上滑选自动回到追加模式（每轮独立判定）；改动收在 `BigBangLayer` 一处（`_applyRange` 按模式分流 + 起步判定 + 两处收尾复位），主 App/悬浮窗两侧共用同时生效，调用方零改动；新增 widget 测试 4 例（滑过取消+复制剩余 / 拖回恢复 / 追加轮不误剔 / 取消后重新追加），flutter analyze 0 error + flutter test 753 全过（749 基线+4 新增）；详见「大爆炸分词层」手势模型小节 |
+| （2026-10-08 本次提交） | **大爆炸层白底浅色化 + 下层压暗遮罩**（用户需求：分词弹窗改锤子原版白色卡片视觉，顶部/底部透出下层画面处要有明暗分层；白底下文字变黑、滑选选中变白）——收在共用组件 `BigBangLayer` + `OverlayConstants` 一处两侧同时生效：①`bigBangBackground` 深色（0xFA101319）→ 近不透明白（0xFAFFFFFF），文字/控件配色整体反转——未选词块浅灰底（black 5%）深字（black87）、选中维持主题蓝底白字（滑选/点选即「变白」，对齐原版选中高亮）、标点 black38、顶栏标题/计数/全选清空/关闭钮与「分词中…」深色化、底栏预览条与禁用按钮浅灰化；②新增 `bigBangScrimColor`（35% 黑）统一铺在顶部留白、圆角缺口层、底部关闭条三处透出下层画面的区域——下层内容隐约可辨但明确退到「下一层」，白色主体浮出；吸收触摸的 GestureDetector 结构不变（遮罩只改视觉不改命中）；改动不涉及手势/分词/复制逻辑；新增浅色配色 widget 测试 1 例（白底常量钉死 + 遮罩 3 处计数 + 未选词块深字断言）、圆弧测试名对账，flutter analyze 0 error（warning 均为基线既有）+ flutter test 754 全过（753 基线+1 新增）；详见「大爆炸分词层」小节首段 |
 
 ## 核心架构
 
@@ -162,19 +183,19 @@
 - 时长 key `overlay_auto_hide_seconds`（默认 10，设置页 5/10/30s + 「永久」ChoiceChip，同音量键手势选择器的样式；「永久」写哨兵值 `OverlayConstants.autoHideNeverSeconds`（-1）进同一 key，`_scheduleAutoHide` 读到即 return 不起 Timer——收起态把手常驻，改回限时档后下次收起自然恢复计时）。**每次收起时 `await prefs.reload()` 再读**——主 engine 写、overlay engine 读，两个 isolate 的 prefs 内存缓存隔离，不 reload 读到旧值
 - 竞态防护：`_hideScheduleGeneration` 计数——reload 的 await 期间用户又展开/收起，generation 不一致则本次排定作废，避免"展开的面板被误关"
 
-### 息屏自动隐藏（AOD 防残留，2026-09-22 两轮）
+### 息屏自动隐藏（AOD 防残留，2026-09-22 两轮 + 2026-09-28 永久档穿越）
 
 用户场景：录完音不管悬浮窗，手机息屏后把手/贴边竖线（竖线驻留开关默认开）仍显示在 **AOD 息屏时钟**画面上——`TYPE_ACCESSIBILITY_OVERLAY` 特权层在 AOD 上继续参与合成。
 
-**第一轮（GONE 暂藏）**：SCREEN_OFF 时窗口 `visibility=GONE`、SCREEN_ON 恢复。真机使用后用户升级诉求：亮屏后悬浮窗"恢复"出把手/面板也不想要——**第二轮定版语义「进 AOD 必须收」**：息屏瞬间即推进到驻留终态，此后亮屏/解锁都只会看到贴边竖线（开关开）或什么都没有（开关关），把手/面板不复活。
+**第一轮（GONE 暂藏）**：SCREEN_OFF 时窗口 `visibility=GONE`、SCREEN_ON 恢复。真机使用后用户升级诉求：亮屏后悬浮窗"恢复"出把手/面板也不想要——**第二轮定版语义「进 AOD 必须收」**：息屏瞬间即推进到驻留终态，此后亮屏/解锁都只会看到贴边竖线（开关开）或什么都没有（开关关），把手/面板不复活。**第三轮（2026-09-28，用户拍板）**：「进 AOD 必须收」收窄为仅限时档——「永久」档用户反馈"息屏解锁后把手没了"（log2 实锤：永久+竖线关被无条件推进 closeOverlay），永久的字面承诺就是把手一直在，改为把手驻留穿越 AOD。
 
 - **检测 = `ACTION_SCREEN_OFF` 广播**，复用笔记锁定「锁屏即重锁」的同一个 receiver（`onServiceConnected` 注册，IntentFilter 追加 `ACTION_SCREEN_ON`；两 action 均为受保护系统广播，仅系统可发，registerReceiver 无需 export flag）——ACTION_SCREEN_OFF 在息屏时刻即发出，AOD 属非交互态，「屏幕变黑」与「进入 AOD」都被它覆盖，无需专门的 AOD/DOZE 检测 API（各 ROM 的 doze 监听不统一，也不必用）
-- **息屏动作两步**：①`visibility=GONE`（Kotlin `setOverlayGoneForScreen`，AOD 立即干净，录音/转写链路与自动隐藏计时不受影响——录音中息屏录音不中断）；②发 `screenAutoHide` 消息（`dartReady && !proHintActive` 守卫）→ Dart `OverlayHome._onScreenAutoHide` 立即收起到驻留终态——「隐藏后保留贴边竖线」开关开 → `_enterEdgeLine()`（缩成 20×64 线态驻留）、关 → `closeOverlay()` 彻底移除。**「永久」档（overlay_auto_hide_seconds=-1）在息屏场景不生效**——它只管亮屏期间常驻，息屏推进无条件（AOD 防残留是硬需求）
+- **息屏动作两步**：①`visibility=GONE`（Kotlin `setOverlayGoneForScreen`，AOD 立即干净，录音/转写链路与自动隐藏计时不受影响——录音中息屏录音不中断）；②发 `screenAutoHide` 消息（`dartReady && !proHintActive` 守卫）→ Dart `OverlayHome._onScreenAutoHide` 先把展开面板跳终态收回把手（面板永不穿越息屏），再按纯函数 `OverlayConstants.screenOffActionFor` 分流——**「永久」档（overlay_auto_hide_seconds=-1）把手驻留穿越 AOD**（不推进竖线/移除，竖线开关在永久档下对息屏不生效）；限时档维持「进 AOD 必须收」——「隐藏后保留贴边竖线」开关开 → `_enterEdgeLine()`（缩成 20×64 线态驻留）、关 → `closeOverlay()` 彻底移除
 - **为什么跳终态而不走 `_collapse` 推屏动画**：息屏后窗口 GONE、vsync 停、AnimationController 不跑，等 dismissed 边界回调会卡到亮屏才缩窗；黑屏期间无人在看，空白帧协议（防旧纹理重投影被用户看见）在 GONE 下天然满足。`_enterEdgeLine` 的 `awaitingResize` 守卫照挂——息屏期间 viewport metrics 可能不回调，亮屏后首个 build 由 `_maybeAdvanceMetricsStage` 解除，竖线淡入
 - **守卫**：录音/转写中跳过推进（活动会话不打断；黑屏期间窗口 GONE 不可见，录音结束后自然走既有自动隐藏链，亮屏恢复看到的是录音现场）；Pro 提示窗跳过（3 秒自收窗）；编辑中先 `_saveEdit()`（失败留在编辑态放弃收起，不丢输入，同 `_openDiaryPage` 先例）；息屏推进先作废挂起的自动隐藏 Timer（防遗留计时到期空转/串扰）
-- **亮屏 = `ACTION_SCREEN_ON` 恢复 VISIBLE**（`overlayHiddenByScreenOff` 标志只撤销"因息屏而 GONE"的隐藏 + engine 手动 `appIsResumed()` 同 `getOrCreateOverlayEngine` 复用分支先例防画面冻结）——恢复的只是竖线/录音现场，把手/面板在息屏瞬间已被收掉，不存在"复活"。悬浮窗在锁屏上可见是产品既有行为（「笔记锁定」小节威胁模型，有打码兜底）
+- **亮屏 = `ACTION_SCREEN_ON` 恢复 VISIBLE**（`overlayHiddenByScreenOff` 标志只撤销"因息屏而 GONE"的隐藏 + engine 手动 `appIsResumed()` 同 `getOrCreateOverlayEngine` 复用分支先例防画面冻结）——恢复的是分流后的驻留形态：限时档只有竖线/录音现场（把手/面板在息屏瞬间已被收掉，不存在"复活"）；永久档是把手原样回来（窗口未被移除，GONE→VISIBLE 即回归）。悬浮窗在锁屏上可见是产品既有行为（「笔记锁定」小节威胁模型，有打码兜底）
 - **正交性**：visibility 与 alpha（隐藏窗揭示期 0 / 认证让位 0.15）是两个维度，恢复 VISIBLE 不会泄露 alpha=0 的未揭示窗口；窗口已移除（overlayView 空 = 悬浮窗本就彻底隐藏）时 no-op
-- 回归点：录完音不管 → 息屏（AOD 无残留）→ 亮屏锁屏页只有竖线 → 解锁主屏也只有竖线；展开面板态息屏同此；录音中息屏 → 亮屏录音/转写链路完整；竖线态息屏 → 亮屏竖线原样；贴边竖线开关关的用户息屏 → 亮屏什么都没有（音量键可重新召唤）
+- 回归点：录完音不管 → 息屏（AOD 无残留）→ 亮屏锁屏页只有竖线 → 解锁主屏也只有竖线；展开面板态息屏同此；录音中息屏 → 亮屏录音/转写链路完整；竖线态息屏 → 亮屏竖线原样；贴边竖线开关关的用户息屏 → 亮屏什么都没有（音量键可重新召唤）；**「永久」档用户息屏 → 解锁把手原样回来**（不缩竖线不移除；若息屏前面板展开，回来的是把手而非面板）
 
 ### 把手长按拖动（2026-09-09，收起态纵向位置调整）
 
@@ -209,6 +230,26 @@
 - **拟物胶囊💊（pill3d）**：白 + 珊瑚红(#E0524E) 立体药丸，纯造型**无图标无文字**（任何档位）——中缝分界 + 左侧高光条（白 0.65→0 竖渐变，`capsuleWidth×0.2` 宽）+ 下半暗部渐变（50% 起加深、上半白不受影响）三层叠出立体感
 - **色系一致的钉子**：bluePurple 色值测试直接断言 `defaultCardColor`——卡片默认色将来改动此处会红，提示同步决策把手是否跟随
 
+### 面板字体大小档位（2026-09-27，五档）
+
+设置页悬浮窗二级页「字体大小」五档 ChoiceChip（特小/小/标准/大/特大），prefs `overlay_font_size_step`（int 档位 -2~+2，`parseFontSizeStep` clamp 到连续刻度——与把手大小的白名单语义不同），**每档 1pt**（用户需求 ±2 个字号：0.5pt 档差真机不可辨，2pt 档差最小档跌破可读下限，故取 1pt）。
+
+- **作用范围只限日记面板文字**：卡片收起态单行/展开正文/时间行/重放录音/锁定打码/编辑输入框/删除确认 + 面板「已归档」分隔线/空态/错误态。三处刻意不缩放：把手（有独立大小档位，叠加会双重缩放）、语音速记胶囊（宽度预算按 15 号字调过）、临时提示胶囊（转瞬 UI）
+- **实现**：基准 + 档位统一走 `OverlayConstants.fontScaled`（卡片侧 `_fs()` 简写 / OverlayHome 侧同名简写）；渲染与三处 painter 测量（`_estimateCollapsedWidth`/`_estimateExpandedHeight`/`_charOffsetAt`）同源缩放——046fe0b「测量环境必须与实际渲染一致」的延伸
+- **⚠️ 测量缓存 key 必须含字号**：`_kCollapsedTextWidthCache` 不同档位同文本宽度不同，不进 key 会串档，估算偏窄把短文字顶出省略号
+- **⚠️ 勾选框反缩放倍率用缩放后字号**：框架按 `textScaler.scale(正文字号)/字号` 放大 WidgetSpan 子项，倍率计算若用未缩放基准，档位非 0 时勾选框尺寸二次偏差
+- **生效时机**同把手大小：`_refreshOverlayConfig`/`_scheduleAutoHide` reload 读取，下一次状态转换生效，已显示中的面板不瞬变；同走 Pro 门禁（设置页 chip 点击 `_ensureOverlayPro`）
+
+### 面板高度（可见条数档位，2026-10-06，五档）
+
+用户需求：大屏手机单手拿时，面板顶部的新建/展开按钮在屏幕上方、大拇指够不着。设置页悬浮窗二级页「面板高度」五档 ChoiceChip（10/9/8/7/6 条，默认 10 = 历史行为），prefs `overlay_panel_max_cards`（int 6~10，`parsePanelMaxCards` clamp 连续刻度语义同 fontSizeStep）。单位用**条数**（用户拍板：比高/中/低档位直观，改几条就是少看几条）。
+
+- **⚠️ 关键设计：面板是顶部锚定布局，只缩列表限高不能让顶部按钮下移**——面板贴停靠侧上角（Align topRight/topLeft），单纯把列表限高调小只会让面板底边上移，header 按钮组原地不动，够不着的问题依旧。正确做法 = **列表限高按档位缩 + 面板顶部等量下压偏移**：`panelTopOffsetFor(n)` =（默认档 − 当前档）×（卡片高+间距），以 Padding 包在面板 Align child 外层。兑现用户描述的「满列表整列底边位置不变、顶部按钮组逐档下移进拇指区」
+- **设计不变量**：`panelTopOffsetFor(n) + panelListMaxHeightFor(n)` 对任意档位为定值（满列表底边不动，测试钉住）；默认档限高 == 旧常量 `panelListMaxHeight`（历史行为零变化，测试钉住）
+- **⚠️ 差一条修正（2026-10-06 真机实测：10 档见 11 张 / 6 档见 7 张）**：ListView/SliverPadding 的 padding **只计入滚动范围、不裁剪视口**——滚动到顶时视口内卡片可见区 = 限高 − top padding（8），底部 padding 48 是滚动范围末尾的留白、要滚到底才出现。历史限高公式把 +48 也算进去，可见区多出 48 > 卡高 46，第 N+1 张卡完整露出。修正：限高只加顶部 padding 8（`cards × (卡片高+间距) + 8`），视口卡片可见区恰好 N 张、第 N+1 张 0 像素（测试钉住）；底部 padding 48 保留不动（滚到底避让导航栏的既有职责）
+- **矮屏安全**：Padding 在 Align（StackFit.expand 给的满窗紧约束）内缩小可用高度，Column 的 Flexible 列表仍被窗口剩余高度约束，下压后底部不溢出
+- **生效时机**同把手大小：`_refreshOverlayConfig`/`_scheduleAutoHide` reload 读取，下一次状态转换生效，已展开的面板不瞬移；同走 Pro 门禁；Kotlin 零改动
+
 ### 笔记锁定（2026-09-22，悬浮窗/锁屏防偷看）
 
 悬浮窗在锁屏上可见（`TYPE_ACCESSIBILITY_OVERLAY` 系统放行），锁屏页亮着时旁人不解锁手机就能看到笔记内容——笔记锁定功能的威胁模型即此。diary 加 `is_locked` 列（v15，用户手动锁定，免费功能无 Pro 门禁），主 App 与悬浮窗全链路打码 + 设备凭据认证后可看；完整数据层/主 App 侧设计见 @docs/architecture/database.md v15 行。
@@ -226,6 +267,8 @@
 
 **悬浮窗打码范围**：收起态单行文本、展开态正文（`OverlayDiaryCard.lockedHidden`，明文一帧不进组件树）、播放行隐藏；宽度估算用打码文本（不泄露笔记长度）。门禁入口（`OverlayHome._ensureNoteUnlocked`）：展开/编辑/复制/AI 对话/播放/删除/闹钟（闹钟会读正文做时间解析）；划走归档放行、已归档划走（=删除）门禁；锁定/解锁按钮在卡片底条（`onLockToggle`）。认证前点开的卡记住意图，认证成功自动展开。
 
+**加锁前置检查（2026-10-08，用户要求）**：点锁按钮**加锁**前先查设备是否已设锁屏凭据（`KeyguardManager.isDeviceSecure`，PIN/图案/密码）——未设置时不允许锁定：锁定后没有任何认证手段能看回内容，锁定形同虚设反而误导用户以为已保护。两个加锁入口（主 App `DiaryTabState._toggleDiaryLock` / 悬浮窗 `_OverlayHomeState._toggleDiaryLock`）在写库前各自经本 engine 的通道查询（新增通道方法 `isDeviceSecure`，MainActivity 与无障碍服务双通道各一份实现），未设置则弹引导对话框「未设置锁屏密码」（「去设置」经新增 `openSecuritySettings` 拉起系统安全设置页，悬浮窗侧 NEW_TASK；「取消」什么都不做），**本次不加锁**。通道异常按「未设置」失败关闭（安全侧兜底）。解除锁定不受影响（解锁认证链路 `NoteUnlockActivity` 本来就有 `isDeviceSecure` 兜底拦截）。封装：主 App `NoteLockAuth.isDeviceSecure/openSecuritySettings`、悬浮窗 `AccessibilityOverlay.isDeviceSecure/openSecuritySettings`；通道封装单测见 `test/note_lock_auth_test.dart`。
+
 ### 滑动展开的两档触感反馈（2026-09-13 首版，2026-09-14 真机对调）
 
 「朝屏幕内侧滑展开」是盲手势（目标小、无视觉确认），补震动反馈；同一手势在把手/竖线两态拉开强度差（用户定夺：线态强、胶囊态弱）：
@@ -240,7 +283,7 @@
 
 **何时进入**：收起后自动隐藏计时到期 + 设置开关「隐藏后保留贴边竖线」（`overlay_edge_line_enabled`，默认开）打开 → `_enterEdgeLine` 把窗口从把手（28×88）缩成线态（20×64）；关闭则维持旧行为 closeOverlay 彻底移除窗口（只能音量键召唤）。
 
-**形态 = 视觉线窄、触摸区宽**：窗口 20×64dp（`edgeLineWindowWidth` = 透明触摸缓冲区），视觉线 4dp（`edgeLineWidth`，用户定夺 ≈1mm）贴停靠缘绘制（Align 贴缘），GestureDetector `HitTestBehavior.opaque` 整窗可命中。为什么加宽：首版窗口宽=线宽=4dp，手指起点（接触面 8~10mm）很难按中，按偏后落在窗口外的边缘滑动被系统当作返回手势——用户感知为"竖线难触发、和侧滑返回冲突"。透明缓冲不牺牲下层触摸：贴边 ~24dp 本来就是系统返回手势区（systemGestureInsets），手势导航下该条带触摸到不了下层应用（三键导航只挡边缘无可点控件的条带）。市面产品调研（微信浮窗/悬浮球类）均为"窄视觉+宽触摸"路数；第三方无法用 `setSystemGestureExclusionRects` 抢边缘手势（该 API 对 overlay 窗口普遍无效，官方仅支持 Activity 内 view）。
+**形态 = 视觉线窄、触摸区宽**：窗口 20×64dp（`edgeLineWindowWidth` = 透明触摸缓冲区），视觉线 4dp（`edgeLineWidth`，用户定夺 ≈1mm）贴停靠缘绘制（Align 贴缘），GestureDetector `HitTestBehavior.opaque` 整窗可命中。**距屏幕边缘间距三档可调**（2026-09-29，`overlay_edge_line_margin_dp`：0 贴边/4/8 最里，设置页「贴边竖线」卡选择器）——纯 Dart 视觉内移（竖线在窗口内经 `edgeLinePadding` 向屏内侧偏移），窗口与触摸缓冲区不动，窗口内硬上限 16 = 窗口宽 − 线宽；读取/生效时机同把手大小（下一次状态转换），随停靠侧镜像。为什么加宽触摸区：首版窗口宽=线宽=4dp，手指起点（接触面 8~10mm）很难按中，按偏后落在窗口外的边缘滑动被系统当作返回手势——用户感知为"竖线难触发、和侧滑返回冲突"。透明缓冲不牺牲下层触摸：贴边 ~24dp 本来就是系统返回手势区（systemGestureInsets），手势导航下该条带触摸到不了下层应用（三键导航只挡边缘无可点控件的条带）。市面产品调研（微信浮窗/悬浮球类）均为"窄视觉+宽触摸"路数；第三方无法用 `setSystemGestureExclusionRects` 抢边缘手势（该 API 对 overlay 窗口普遍无效，官方仅支持 Activity 内 view）。
 
 **配色 = 明暗渐变（2026-09-14，用户拍板方案 D）**：屏内端深灰（`edgeLineGradientDeep` 0xD9464646）→ 贴缘端浅灰（`edgeLineGradientLight` 0xD9C8C8C8）的横向 `LinearGradient`，方向随停靠侧镜像（右缘 = 左深右浅，左缘反之）。动机：更早的单一半透明白（0x73FFFFFF）在白色/浅色背景上数学上恒为白不可见（白+白=白，加 alpha 无解）；「自动随背景变色」不可行——悬浮窗拿不到下层像素（Flutter BackdropFilter 只作用窗口内；原生 FLAG_BLUR_BEHIND 是模糊非取色且 Android 12+/部分 ROM 禁用；截屏取色需 MediaProjection 每次授权）。渐变让线自带明暗两成分：白底看深端（WCAG 6.1:1）、黑底看浅端（9.0:1），任何背景至少一端可见（地图/字幕同思路）。⚠️ 纯灰背景（≈#808080）两端对比都弱（≈2:1），属已知取舍。方案对比（加不透明度 / 中性灰 / 黑心白边夹心 / 明暗渐变）与可交互预览：[docs/previews/edge_line_contrast_preview.html](../previews/edge_line_contrast_preview.html)。
 
@@ -303,7 +346,7 @@
 - **L17 / L20**：`handleIconSize = 16.0` / `handleFontSize = 11.0`
 - **L73**：`panelSlideDuration = 240ms`（面板推屏滑动动画时长）
 - **L136 / L142**：`voiceMemoWindowWidth = 312` / `voiceMemoWindowHeight = 84`（语音速记冷启动隐藏窗口直建尺寸，Kotlin 侧有硬编码副本须同步；84 = 胶囊 44 居中带 + 下部提示条带，须 < handleHeight 88——见「停止提示胶囊」小节）
-- **线态常量**：`edgeLineWidth = 4`（视觉线宽）/ `edgeLineWindowWidth = 20`（窗口宽 = 触摸缓冲区）/ `edgeLineHeight = 64` / `edgeLineGradientDeep·Light`（明暗渐变双色，见「贴边竖线驻留」小节配色段）/ `edgeLineEnabledPrefKey`（驻留开关）/ `edgeLineTapEnabledPrefKey`（点按回把手开关）——线态窗口宽与 Kotlin `EDGE_LINE_WIDTH_THRESHOLD_DP`(24) 是双侧副本
+- **线态常量**：`edgeLineWidth = 4`（视觉线宽）/ `edgeLineWindowWidth = 20`（窗口宽 = 触摸缓冲区）/ `edgeLineHeight = 64` / `edgeLineGradientDeep·Light`（明暗渐变双色，见「贴边竖线驻留」小节配色段）/ `edgeLineEnabledPrefKey`（驻留开关）/ `edgeLineTapEnabledPrefKey`（点按回把手开关）/ `edgeLineMarginPrefKey` + `parseEdgeLineMargin` / `edgeLinePadding`（距屏幕边缘间距三档 0/4/8，纯 Dart 视觉内移，见「贴边竖线驻留」小节）——线态窗口宽与 Kotlin `EDGE_LINE_WIDTH_THRESHOLD_DP`(24) 是双侧副本
 - **语音速记停止提示**：`voiceMemoStopHintMaxShows = 2` / `voiceMemoStopHintCountPrefKey = 'overlay_voice_memo_hint_shown_count'` / `voiceMemoHintGap = 3`（见「停止提示胶囊」小节）
 
 ### lib/overlay/overlay_home.dart
@@ -402,7 +445,7 @@
 停止录音有两条路（贴屏端停止钮 / 再次长按音量上键），后者没有任何界面可见性——不看说明书的用户只知道按钮一条路。故在**录音胶囊正下方**追加一枚提示胶囊（`_StopHintPill`，文案「再次长按音量上键，停止并转写」），只在前 2 次速记录音展示（教育目的是"知道有这回事"，常驻反而喧宾夺主）：
 
 - **展示计数跨会话持久化**：prefs key `overlay_voice_memo_hint_shown_count`（int，写入方/读取方均为 overlay engine 的 `OverlayVoiceMemoController.start`——开录时读（判定纯函数 `shouldShowStopHint(count)` = `count < 2`），开录成功即自增落盘（哪怕秒停/空录音丢弃也计为"已展示"，防反复打扰）；读取失败按"不再展示"兜底（宁缺勿扰）。只在录音态渲染，进转写即撤（`stop()`/`fail()` 复位 `showStopHint`）
-- **窗口加高 64→84**（`voiceMemoWindowHeight`，Kotlin `VOICE_MEMO_OVERLAY_HEIGHT_DP` 硬编码副本同步）：84 = 胶囊 44 垂直居中带 + 下部提示条带（提示胶囊 ≈21dp + 间距 3dp）。展示提示时"胶囊+提示"整块在窗口内垂直居中，胶囊仅比历史位置上移 ~8dp；**84 必须 < 把手高 88**——build 硬不变量按「窗口高 < 把手高」判定 idle 帧渲染空白，≥88 会让 pre-gate 帧误渲染把手
+- **窗口加高 64→84**（`voiceMemoWindowHeight`，Kotlin `VOICE_MEMO_OVERLAY_HEIGHT_DP` 硬编码副本同步）：84 = 胶囊 44 垂直居中带 + 下部提示条带（提示胶囊 ≈21dp + 间距 3dp）。展示提示时"胶囊+提示"整块在窗口内垂直居中，胶囊仅比历史位置上移 ~8dp；**84 必须 < 把手高 88**——build 硬不变量按 `isCapsuleHeightWindow`（阈值=两高度中点 86）判定 idle 帧渲染空白，≥88 会与把手窗高度档重叠、pre-gate 帧误渲染把手
 - **配色 = 录音胶囊同款黑 72% 半透明底 + 白字 11 号**：悬浮窗下垫任意壁纸/应用，浅灰字裸放会在白色背景的应用上直接消失，自带深色底才有跨背景对比度保障（垫纯白背景时等效底色 ≈#4a4a4a，白字对比度 ≈8:1），且与录音胶囊构成同一视觉家族。提示胶囊贴屏端边缘与录音胶囊对齐（二者同带 12dp 停靠侧边距，随 `dockLeft` 镜像），不随胶囊变长移动
 - **措辞强调「长按」**：启动与停止都是长按音量上键（短按是系统音量条），含糊的"再按"会诱导用户短按 → 只看到音量条、录音没停，反而制造新困惑
 - 测试：`test/overlay_voice_memo_bar_test.dart`（展示/不展示/转写态不展示/左右缘贴屏端对齐/`shouldShowStopHint` 纯函数）
@@ -430,7 +473,20 @@ showOverlay(hidden=true) → 窗口直接以胶囊尺寸 312×84 立即 addView�
   合成可能晚 1~2 vsync，多等一帧是便宜保险；首个可见帧即正确尺寸录音胶囊
 ```
 
-Dart 侧另有一条不依赖时序的**硬不变量**（build 顶层，语音速记分支之前）：`_voiceMemo.state == idle && constraints.maxHeight < handleHeight` → 渲染纯空白。把手（88dp 高）永远不可能合法出现在胶囊高度（84dp）的窗口里，attach 瞬间/消息到达前的 pre-gate 帧物理上渲染不出把手。
+Dart 侧另有一条不依赖时序的**硬不变量**（build 顶层，语音速记分支之前）：`_voiceMemo.state == idle && OverlayConstants.isCapsuleHeightWindow(constraints.maxHeight)` → 渲染纯空白。把手（88dp 高）永远不可能合法出现在胶囊高度（84dp）的窗口里，attach 瞬间/消息到达前的 pre-gate 帧物理上渲染不出把手。判定阈值取两设计高度中点 86（`handleWindowHeightThreshold`），⚠️ 不能直接 `< handleHeight`——dpToPx 取整误差会让把手窗实测小于 88（见下节「硬不变量高度误判」）。
+
+#### 硬不变量高度误判（2026-09-27 修复，真机反馈「把手不显示、点竖线后消失」）
+
+**症状**：Redmi（miro，Android 16/HyperOS，450dpi）用户收起面板后把手永不出现、点贴边竖线回把手后竖线"消失"（窗口变成 28×88 隐形空白），只有滑动竖线能展开面板。渲染分支追踪日志显示每次缩窗回把手后都是「resize 已落地 27.7x87.8 → 硬不变量空白」。
+
+**根因**：Kotlin `dpToPx` 对 88dp 截断取整——density 2.8125（1080px/384dp）下 88×2.8125=247.5px 截成 247px，Flutter 侧量到的窗口高 = 247/2.8125 = **87.8 < 88**，把手窗口自己被硬不变量误判为胶囊高度档，把手像素永远不进帧。竖线能渲染是因为判定带 `!isEdgeLine` 例外；440dpi（density 2.75，88dp→242px→88.0 整）等密度整除的设备不触发，开发侧复现不了。
+
+**修复（双保险）**：
+
+1. **Dart 主修复**：判定改走纯函数 `OverlayConstants.isCapsuleHeightWindow(maxHeight)`，阈值 `handleWindowHeightThreshold` = 把手高与胶囊窗高的中点（(88+84)/2 = 86）。安全性论证：dp→px 取整误差恒 <1px（≤1dp，mdpi 极端也就 1dp），把手窗实测最低 ≈87.0、胶囊窗实测最高 ≈84.5，86 落在两侧安全区正中，任意密度不踩界。测试 `test/overlay_window_height_threshold_test.dart`（83.0/83.9/84.0 → true，87.0/87.8/88.0 → false，竖线 64 → true 但由 isEdgeLine 例外放行）。
+2. **Kotlin 配套**：`dpToPx(Int)` 截断（`.toInt()`）改四舍五入（`.roundToInt()`），247.5→248px→88.18，把手窗实测回到 ≥88，减少其他「== 把手宽/高」类判定的踩坑概率（拖动守卫等比较双侧同函数换算，一致性不受影响）。
+
+**教训**：用「实测窗口尺寸 vs 设计常量」做分类判定时，比较必须带取整容差——实测值 = round/trunc(dp×density)/density，与设计值最多差 1px；两个设计值间距（4dp）远大于误差上界（1dp）时，取中点阈值是最稳的判定。
 
 清空方：`voiceMemoUiReady` 揭示 / `hideOverlay` / `destroyOverlayEngine`；防御兜底：pending 期间收到展开尺寸（width==-1，转写完成切面板）时 `resizeOverlay` 顺带揭示，防 voiceMemoUiReady 漏收后面板永远不可见；`triggerShowOverlay` 的 toggle 判断要求 `!pendingVoiceMemoReveal`（隐藏中用户不可见，不算"已显示"）。`_onVoiceMemoChanged` 的 `resizeOverlay(312,84)` 保留不动——把手在屏上开录的暖路径仍需要；冷路径是同尺寸 updateViewLayout，幂等无害。
 
@@ -577,6 +633,61 @@ tag→颜色映射唯一真值在 [lib/utils/diary_tag.dart](../../lib/utils/dia
 | [lib/overlay/overlay_home.dart](../../lib/overlay/overlay_home.dart) | `_setDiaryTag` |
 | [lib/db_helper.dart](../../lib/db_helper.dart) | diary.tag 列（v9→v10 迁移）+ `updateDiaryTag` |
 | [lib/diary_tab.dart](../../lib/diary_tab.dart) | 主 App 卡片 8dp 标注小色点（`_buildNormalCard` 时间行） |
+
+## 卡片长按拖动排序（2026-09-29）
+
+展开面板的**收起态活跃卡**长按进入拖动排序：拖起瞬间 tick 震动，拖动中其余卡片对应移动让开，松手落位后持久化。**已展开卡、归档区卡、编辑中的卡片不可拖**（长按落回 onTap 展开/滑走归档既有手势，互不冲突）；锁定卡允许拖。顺序持久化到 diary 表 `sort_order` 列（方案 B 拍板：双端一致），主 App 日记页与电脑访问服务读同一 getDiaries SQL 自动跟随——字段语义/迁移/回填细节见 @database.md v16 行。
+
+### 实现要点
+
+- **列表换 `ReorderableListView.builder`**（其余参数与原 ListView 等价：shrinkWrap/padding 不动）：`buildDefaultDragHandles: false` 关掉默认短按手柄，itemBuilder 里仅对满足条件（活跃 && 未展开 && 非编辑中）的卡片包 `ReorderableDelayedDragStartListener(index:)`——编辑中整列禁拖与既有 `SwipeDismissCard(enabled: _editingDiaryId == null)` 同款语义；key 落在外层 listener 上（ReorderableListView 直接 child 必须有 key）
+- **震动**：`onReorderStart` → `AccessibilityOverlay.performHaptic('tick')`（拖起瞬间，与把手/竖线滑动展开同触感家族）
+- **proxyDecorator = `Material(type: MaterialType.transparency)`**：面板背景透明，默认拖拽反馈的 Material elevation 会画出白色底块+阴影（透明面板禁 boxShadow 的既有教训同款）
+- **落点 clamp 收纯函数** `reorderActiveItems`（[lib/overlay/overlay_diary_reorder.dart](../../lib/overlay/overlay_diary_reorder.dart)）：拖到归档区位置 = 落到活跃区末尾，归档区整体与「已归档」分隔线（钉在归档首卡 Column 内）不动；归档卡被拖/原位放置原样返回同一 List 实例，调用方 `identical` 判 no-op（不 setState 不落库）
+- **持久化纪律**（`_onReorderDiary`）：内存先行（setState 立即落位，拖动/动画期不查库）→ `DbHelper.reorderActiveDiaries(活跃区 id 序)`（事务内规范重写 0..n-1，漏网活跃行续排尾部、归档行不动，内部 bump 云同步数据版本）→ `DiarySyncBridge.bump()`（主 App 日记页感知）；失败 catch + `_loadDiaries(showLoading: false)` 回库恢复真相（照 `_setDiaryTag` 模式）
+- **真机回归点**：长按活跃收起卡可拖、展开/归档/编辑卡拖不动、拖到最底落活跃区末尾、归档分隔线不乱、主 App 日记页回前台顺序同步
+
+## 大爆炸分词层（2026-10-06；2026-10-07 词块区纵向居中 + 主 App 层顶边降高 + 四角圆弧；2026-10-08 白底浅色化 + 下层压暗遮罩）
+
+展开卡查看态正文**长按**唤起全屏白底模态（锤子 Big Bang 式；2026-10-08 起由深色改浅色，对齐锤子原版白色卡片视觉——文字/词块配色随之反转：未选词块浅灰底深字、选中主题蓝底白字、顶栏/底栏控件同步浅色化）：正文被炸成一个个词块，点选 toggle、滑动连选区间，底栏预览选中拼接文本，一键复制后自动关层。用户拍板：滑动连选首期就要做、做全屏视觉（非底部弹层）。**词块区内容纵向居中（2026-10-07 用户拍板，主 App/悬浮窗共用本层一处生效）**：短内容在词块区居中展示而非从顶往下排，长内容超出视口仍可滚动——`LayoutBuilder` 取视口高 → `ConstrainedBox(minHeight: 视口高−上下padding)` → `Center` 包词块 Wrap（Center 在无界高度下收缩到内容、被 minHeight 钳到视口高，内容超高时居中自然退化）。**白色主体四角圆弧（2026-10-07 用户拍板，同样一处生效）**：`OverlayConstants.bigBangCornerRadius`=20dp——Material `borderRadius` + `clipBehavior: Clip.antiAlias`（Material 的 borderRadius 只影响背景形状，子内容须显式 clip 才随圆角裁切），圆角缺口透出压暗的下层画面（2026-10-08 起缺口/顶部留白/底部关闭条三处统一铺 `bigBangScrimColor` 35% 黑遮罩，明暗分层让白色主体浮出，用户拍板），同一「层不撑满全屏」的视觉语言；⚠️ 缺口区域外包 `GestureDetector(opaque, onTap:(){})` 吸收触摸——裁切外的角落若不接住，overlay 侧穿透会命中面板空白区收起手势（把面板连同本层一起收掉），主 App 侧（opaque:false 路由无 barrier）穿透会点到下层日记卡。
+
+> **主 App 随手记复用（2026-10-06 同日；2026-10-07 层顶边降高）**：`BigBangLayer` 同时挂在主 App 日记页——日记卡手势矩阵改为 单击=复制 / 双击=编辑 / **长按=大爆炸**（双击跳 AI 取消，AI 分享保留卡片底部按钮入口；「交换单击与长按」开关变为交换单击↔双击，prefs key 不变）。主 App 侧经透明 `PageRouteBuilder` 推入整层；层顶边 2026-10-07 起从「状态栏高度避让」改为**按悬浮窗「面板高度」8 条档位的顶部高度取值**（`OverlayConstants.bigBangMainAppTopInset` = panelHeaderTopPadding + panelTopOffsetFor(8) = 152dp，用户拍板——主 App 无档位设置项，固定参照 8 条档，比仅状态栏避让矮一截、单手够得着顶栏），`onHaptic` 必须注入 diary_tab 自己的 `_haptic`（缺省走悬浮窗无障碍通道，主 engine 未注册会抛 MissingPluginException），`onCopy` 复用 `_copyToClipboard`。分词器在主 isolate 独立懒加载（static 缓存不跨 isolate 铁律）。
+
+### 入口与门禁
+
+- **手势分流**：正文点按（进编辑、光标定位点击处）与长按（大爆炸）共存于同一个 GestureDetector——点按从 `onTapDown` 改 `onTapUp` 后，tap 等抬起、long-press 压住即触发，手势竞技场自然分流（down 触发会抢在长按之前先进编辑态）
+- **门禁**：空内容转写占位行与锁定打码卡不传 `onLongPressText`——明文不出卡片，与 AI 对话/复制的锁定门禁同语义（`_isLockedHidden`）
+- **唤起震动**：`performHaptic('tick')`（卡片 AI 对话按钮复制震动的同款 EFFECT_TICK 线性马达家族）；选择变化 tick 40ms 节流
+
+### 分词（[lib/overlay/big_bang_tokenizer.dart](../../lib/overlay/big_bang_tokenizer.dart)）
+
+- 词级切分复用修正对体系的 **dart_jieba**（词典 `assets/jieba_dict.dgz` 运行时拷到数据库目录，拷贝模式照抄 `ContextCorrector._loadSegmenter`）
+- **⚠️ overlay isolate 独立懒加载**：加载结果缓存在本 isolate 的 static——主 engine 经 ContextCorrector 加载过的分词器对 overlay isolate 无效（与 sherpa-onnx FFI 绑定同款铁律）
+- **回退链**：jieba 加载/切分失败一律回退字符级切分 `charSplit`（CJK 逐字、连续 ASCII 字母数字归并），大爆炸永不缺席
+- **二次爆炸 `explodeToChars`**：把选中词块再炸成单字（中文逐字、英文逐字母）——与 `charSplit` 的契约差异：charSplit 是回退链语义（连续 ASCII 归并为一个词），explodeToChars 逐 rune 切、每 rune 一个 token；`String.runes` 按 code point 迭代，emoji 代理对天然不劈开（😀 整体一个不可选 token），标点/空白不可选但保留在序列，"拼接==原文"不变量保持
+- **⚠️ jieba 会劈开 emoji 代理对**：dart_jieba 按 UTF-16 code unit 切分，`😀` 会被切成高代理+低代理两个 token——孤立代理不是合法 UTF-16，Text 渲染直接抛 `string is not well-formed UTF-16`（真机 logcat 刷屏根因）。`fromRawTokens` 按代理对完整性把相邻碎片并回完整字符再判可选性，"token 拼接 == 原文"不变量保持
+- token 模型：含字母/数字/汉字的可选，纯标点/空白不可选但**保留在序列**——`joinSelected` 把夹在选中词之间的标点/空格原文带出（选 {0,2,4} over `苹果，牛奶 bread` → `苹果，牛奶 bread`）；跳过可选词 = 跳跃点选，间断区原文不带出，但**间断区首/尾紧贴空白时交界补一个空格**——两次滑选的英文词组交界不粘词（修复前 `touch and holdafter two hours`，真机反馈），中文跳跃点选边界本无空格行为不变
+
+### 手势模型（[lib/overlay/widgets/big_bang_layer.dart](../../lib/overlay/widgets/big_bang_layer.dart)）
+
+| 手势 | 实现 |
+|---|---|
+| 点选 | 词块自带 GestureDetector(onTap) toggle |
+| 滑动连选/取消 | 外层 **Listener**（不参与手势竞技场、全量收指针事件）按下命中可选词块记锚点，位移超 **kTouchSlop**（与 tap 识别器同阈值）才进连选——未超松手 = tap 照常 toggle，互不抢；连选中按锚点→当前命中词块的 index 区间操作；**模式由锚点词块的选中态决定（2026-10-07，锤子原版语义）**——锚点未选中 = **追加置选**（本轮起步快照已有选择为基线 `_dragBase`，区间与基线取并集，松手后再次滑选/点选是追加新词而非覆盖旧选——真机反馈：先滑选开头几个词、再到末尾滑选追加时开头的会丢）；锚点已选中 = **滑动取消**（`_dragDeselect`，区间从基线剔除——在已连选的词块上滑过即取消）；同一轮内拖回缩小区间可恢复（基线不动，只影响本轮划到的范围）；划出词块区端点保持原位 |
+| 滚动仲裁 | Listener 不抢竞技场，ScrollView 垂直滚动照常；按下落在词块上时 physics 换 `NeverScrollableScrollPhysics`（该次手势纯连选，防边选边滚），松手恢复；滚动起点选在词块间隙/空白区即可 |
+
+命中换算：可选词块 GlobalKey 首帧后缓存 Rect，**相对词块区容器**（同一坐标系随滚动整体平移，滚动不失效）+ `inflate(2)` 容错；指针全局坐标经容器 `globalToLocal` 换算求交。
+
+### 生命周期与复制
+
+- 层 = `_buildPanel` Stack 最上层 `Positioned.fill`（展开面板态窗口本就全屏，无需 resize）；父层只存原文 `String? _bigBangText`，词块状态全在层内 State
+- **层顶边对齐面板 header 上缘（2026-10-06，用户反馈全屏太高单手够不着顶栏）**：`BigBangLayer.topInset` = 状态栏固定避让（`OverlayConstants.panelHeaderTopPadding`=40，与 `_buildHeader` 同源唯一真值）+ `panelTopOffsetFor(_panelMaxCards)`——随设置页「面板高度」档位联动下移（档位越低顶边越低，顶栏/词块区整体进拇指区；默认 10 档 inset=40 与旧全屏行为一致）。顶边上方为**留白透出下层画面**（2026-10-08 起铺 `bigBangScrimColor` 压暗遮罩，明暗分层）：留白区 `HitTestBehavior.opaque` + onTap 就地吸收触摸——底层是面板空白区的收起手势，穿透会把面板连同本层一起收掉；横滑在留白区无识别器认领（空白区不在命中路径内）天然无操作。层内原顶部 40 避让移除（改由留白承担）
+- **层底部改透明关闭条（2026-10-07，用户反馈底部 48dp 深色条带「完全盖住」；2026-10-08 透出部分加压暗遮罩）**：原 Material 内 `Padding(bottom: 48)` 深色避让条带移出改 `_buildCloseStrip()`——**透出下层画面（压暗遮罩 `bigBangScrimColor`）** + **整条点击即关闭**（`onTap: widget.onClose`）+ 中间一枚 ✕ 圆形按钮（黑 55% 底白图标）作视觉落点，单手大拇指在底部即可关层；视觉透明但 `HitTestBehavior.opaque` 吸收触摸（穿透到面板空白区会把面板连同本层一起收掉，主 App 侧穿透会点到下层日记卡）；高度 48 沿用原避让惯例。⚠️ 同款修复：顶部留白 `SizedBox` 只给高度时在 Column（交叉轴默认 center）里收缩到 0 宽，「吸收触摸」形同虚设——已补 `width: double.infinity`
+- 清零方：✕ 按钮（顶栏/底部关闭条）/ 复制成功 / 搜索成功 / `_collapse()` / `_resetFromNative()`
+- 复制：`joinSelected` 拼接 → 原生 `copyText` 通道（自带 EFFECT_TICK + 写剪贴板）→ 成功关层，失败留在原地
+- **搜索（2026-10-06）**：底栏预览与复制之间新增搜索按钮（`onSearch` 可空构造参数，null 不渲染）：`joinSelected` 拼接 → `buildSearchUrl(engine, text)`（`lib/utils/big_bang_search.dart`，百度/必应/Google 注册表，`Uri.encodeComponent` 编码）→ 原生 `openUrl` 通道（`Intent(ACTION_VIEW, url)`，选过浏览器则 `setPackage` 指定，`ActivityNotFoundException` 回落系统默认——覆盖浏览器被卸载场景；overlay 侧走 accessibility_overlay 通道加 `FLAG_ACTIVITY_NEW_TASK`，主 App 侧走 app 通道）→ 成功关层，失败留在原地。引擎与浏览器在设置→「大爆炸搜索」二级页选择（prefs `search_engine`/`search_browser_package`/`search_browser_name`，默认百度+系统默认；浏览器列表来自新增通道方法 `getInstalledBrowsers`——`queryIntentActivities(ACTION_VIEW, https)` 枚举真浏览器）；读取方 `loadSearchConfig()` 先 reload（跨 engine 惯例）。无选中不搜（与复制同规则）
+- **二次爆炸（2026-10-06）**：底栏预览与搜索之间的刀图标按钮（`Icons.content_cut` + Tooltip「再炸成单字」，`_buildCapsuleIcon` 与搜索按钮共用样式 helper），点击把选中词块**就地**炸成单字（`explodeToChars`，选中 index 排序后逐个替换、未选中 token 原对象搬运），炸出的可选单字 index 映射进新 `_selected` **保持选中**（用户可立刻复制/搜索，或点掉多余单字逐字微调）；禁用规则 `_canExplode` = 选中中至少一个多字词（选中全是单字/无选中/分词中禁用，幂等）；**不做撤销**——爆炸是追加式变换（可逐字点选修正），重炸成本仅一次长按；⚠️ tokens 更换后 `_prepareKeys` 连带清 `_rects`（旧 index 的命中 Rect 全部失效，setState 到 postFrame 重缓存之间 `_hitToken` 会拿旧 Rect 命中新词块）+ 连选状态（`_pressedToken/_dragAnchor/_dragBase/_scrollLocked`）防御性复位
+- 测试经 `initialTokens` 直通词块跳过 jieba 异步加载、`onHaptic`/`onCopy`/`onSearch` 注入，不触平台通道
 
 ## Pro 门禁（2026-09-03）
 
